@@ -279,7 +279,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 		.amconsistentordering = false,
 		.amcanbackward = false,
 		.amcanunique = false,
-		.amcanmulticol = false,
+		.amcanmulticol = true,
 		.amoptionalkey = true,
 		.amsearcharray = false,
 		.amsearchnulls = false,
@@ -338,7 +338,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->amcanbackward = false;	/* can change direction mid-scan */
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
+	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
@@ -349,7 +349,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 170000
 	amroutine->amcanbuildparallel = true;
 #endif
-	amroutine->amcaninclude = true; /* support optional predicate filtering clauses */
+	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false; /* not used during VACUUM */
 #if PG_VERSION_NUM >= 160000
 	amroutine->amsummarizing = false;

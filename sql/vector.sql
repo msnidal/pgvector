@@ -278,15 +278,6 @@ CREATE FUNCTION hnsw_bit_support(internal) RETURNS internal
 CREATE FUNCTION hnsw_sparsevec_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION hnsw_set_filter(regclass, text, text, text) RETURNS void
-	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
-
-CREATE FUNCTION hnsw_clear_filter(regclass) RETURNS void
-	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
-
-CREATE FUNCTION hnsw_clear_filters() RETURNS void
-	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
-
 -- vector opclasses
 
 CREATE OPERATOR CLASS vector_ops
@@ -339,6 +330,38 @@ CREATE OPERATOR CLASS vector_l1_ops
 	FOR TYPE vector USING hnsw AS
 	OPERATOR 1 <+> (vector, vector) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(vector, vector);
+
+CREATE OPERATOR CLASS vector_bigint_ops
+	DEFAULT FOR TYPE bigint USING hnsw AS
+	OPERATOR 2 <,
+	OPERATOR 3 <=,
+	OPERATOR 4 =,
+	OPERATOR 5 >=,
+	OPERATOR 6 >;
+
+CREATE OPERATOR CLASS vector_integer_ops
+	DEFAULT FOR TYPE integer USING hnsw AS
+	OPERATOR 2 <,
+	OPERATOR 3 <=,
+	OPERATOR 4 =,
+	OPERATOR 5 >=,
+	OPERATOR 6 >;
+
+CREATE OPERATOR CLASS vector_text_ops
+	DEFAULT FOR TYPE text USING hnsw AS
+	OPERATOR 2 <,
+	OPERATOR 3 <=,
+	OPERATOR 4 =,
+	OPERATOR 5 >=,
+	OPERATOR 6 >;
+
+CREATE OPERATOR CLASS vector_uuid_ops
+	DEFAULT FOR TYPE uuid USING hnsw AS
+	OPERATOR 2 <,
+	OPERATOR 3 <=,
+	OPERATOR 4 =,
+	OPERATOR 5 >=,
+	OPERATOR 6 >;
 
 -- halfvec type
 

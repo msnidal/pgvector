@@ -105,7 +105,7 @@ write_workload_script() {
 
   where_clause="$(scenario_where_clause "$scenario")"
 
-  if [ "$method" = "where" ]; then
+  if [ "$method" = "where" ] || [ "$method" = "acorn" ]; then
     cat > "$out_path" <<EOF
 \set qid random(1, :query_count)
 BEGIN;
@@ -129,116 +129,8 @@ EOF
     return
   fi
 
-  case "$scenario" in
-    low)
-      cat > "$out_path" <<'EOF'
-\set qid random(1, :query_count)
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SET LOCAL hnsw.ef_search = :ef_search;
-WITH q AS (
-  SELECT embedding, cat_low::text AS filter_value
-  FROM acorn_queries
-  WHERE id = :qid
-),
-s AS (
-  SELECT hnsw_set_filter('acorn_hnsw_idx', 'cat_low', '=', q.filter_value)
-  FROM q
-)
-SELECT id
-FROM q, s, LATERAL (
-  SELECT id
-  FROM acorn_items
-  ORDER BY embedding <-> q.embedding
-  LIMIT :k
-) nn;
-COMMIT;
-EOF
-      ;;
-    medium)
-      cat > "$out_path" <<'EOF'
-\set qid random(1, :query_count)
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SET LOCAL hnsw.ef_search = :ef_search;
-WITH q AS (
-  SELECT embedding, cat_med::text AS filter_value
-  FROM acorn_queries
-  WHERE id = :qid
-),
-s AS (
-  SELECT hnsw_set_filter('acorn_hnsw_idx', 'cat_med', '=', q.filter_value)
-  FROM q
-)
-SELECT id
-FROM q, s, LATERAL (
-  SELECT id
-  FROM acorn_items
-  ORDER BY embedding <-> q.embedding
-  LIMIT :k
-) nn;
-COMMIT;
-EOF
-      ;;
-    high)
-      cat > "$out_path" <<'EOF'
-\set qid random(1, :query_count)
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SET LOCAL hnsw.ef_search = :ef_search;
-WITH q AS (
-  SELECT embedding, cat_high::text AS filter_value
-  FROM acorn_queries
-  WHERE id = :qid
-),
-s AS (
-  SELECT hnsw_set_filter('acorn_hnsw_idx', 'cat_high', '=', q.filter_value)
-  FROM q
-)
-SELECT id
-FROM q, s, LATERAL (
-  SELECT id
-  FROM acorn_items
-  ORDER BY embedding <-> q.embedding
-  LIMIT :k
-) nn;
-COMMIT;
-EOF
-      ;;
-    range)
-      cat > "$out_path" <<'EOF'
-\set qid random(1, :query_count)
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SET LOCAL hnsw.ef_search = :ef_search;
-WITH q AS (
-  SELECT embedding, score_lo::text AS lo, score_hi::text AS hi
-  FROM acorn_queries
-  WHERE id = :qid
-),
-s1 AS (
-  SELECT hnsw_set_filter('acorn_hnsw_idx', 'score', '>=', q.lo)
-  FROM q
-),
-s2 AS (
-  SELECT hnsw_set_filter('acorn_hnsw_idx', 'score', '<=', q.hi)
-  FROM q
-)
-SELECT id
-FROM q, s1, s2, LATERAL (
-  SELECT id
-  FROM acorn_items
-  ORDER BY embedding <-> q.embedding
-  LIMIT :k
-) nn;
-COMMIT;
-EOF
-      ;;
-    *)
-      echo "Invalid scenario: $scenario" >&2
-      exit 1
-      ;;
-  esac
+  echo "Invalid method: $method" >&2
+  exit 1
 }
 
 pgbench_log_stats() {
@@ -306,11 +198,7 @@ run_recall_case() {
   where_clause="$(scenario_where_clause "$scenario")"
   exact_select="SELECT q.id AS qid, r.id AS item_id FROM acorn_queries q CROSS JOIN LATERAL (SELECT i.id FROM acorn_items i WHERE ${where_clause} ORDER BY i.embedding <-> q.embedding LIMIT ${K}) r WHERE q.id <= ${RECALL_QUERIES}"
 
-  if [ "$method" = "acorn" ]; then
-    actual_select="SELECT q.id AS qid, r.item_id AS item_id FROM acorn_queries q CROSS JOIN LATERAL acorn_bench_acorn_search(q.embedding, '${scenario}', q.cat_low, q.cat_med, q.cat_high, q.score_lo, q.score_hi, ${K}) r WHERE q.id <= ${RECALL_QUERIES}"
-  else
-    actual_select="SELECT q.id AS qid, r.id AS item_id FROM acorn_queries q CROSS JOIN LATERAL (SELECT i.id FROM acorn_items i WHERE ${where_clause} ORDER BY i.embedding <-> q.embedding LIMIT ${K}) r WHERE q.id <= ${RECALL_QUERIES}"
-  fi
+  actual_select="SELECT q.id AS qid, r.id AS item_id FROM acorn_queries q CROSS JOIN LATERAL (SELECT i.id FROM acorn_items i WHERE ${where_clause} ORDER BY i.embedding <-> q.embedding LIMIT ${K}) r WHERE q.id <= ${RECALL_QUERIES}"
 
   sql="
 SET jit = off;
@@ -838,7 +726,7 @@ SELECT i,
 FROM q;
 SQL
 
-ACORN_SUPPORTED="$(PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'hnsw_set_filter')")"
+ACORN_SUPPORTED="$(PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "SELECT COALESCE(pg_indexam_has_property(oid, 'can_multi_col'), false) FROM pg_am WHERE amname = 'hnsw'")"
 
 if [ "$ACORN_SUPPORTED" != "t" ]; then
   echo "ACORN filter functions not available; running where-only benchmark"
@@ -860,60 +748,19 @@ fi
 
 METHOD_LIST="$(IFS=,; echo "${METHODS[*]}")"
 
-INDEX_INCLUDE=""
+INDEX_KEYS=""
 if [ "$ACORN_SUPPORTED" = "t" ]; then
-  INDEX_INCLUDE=" INCLUDE (cat_low, cat_med, cat_high, score)"
+  INDEX_KEYS=", cat_low vector_integer_ops, cat_med vector_integer_ops, cat_high vector_integer_ops, score vector_integer_ops"
 fi
 
 PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" <<SQL
 
 SET maintenance_work_mem = '${MAINTENANCE_WORK_MEM}';
-CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops)${INDEX_INCLUDE};
+CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops${INDEX_KEYS});
 
 ANALYZE acorn_items;
 ANALYZE acorn_queries;
 SQL
-
-if [ "$ACORN_SUPPORTED" = "t" ]; then
-  PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" <<SQL
-
-CREATE OR REPLACE FUNCTION acorn_bench_acorn_search(
-  q_embedding vector,
-  scenario text,
-  q_cat_low int,
-  q_cat_med int,
-  q_cat_high int,
-  q_score_lo int,
-  q_score_hi int,
-  k int
-) RETURNS TABLE(item_id bigint)
-LANGUAGE plpgsql
-AS \$\$
-BEGIN
-  IF scenario = 'low' THEN
-    PERFORM hnsw_set_filter('acorn_hnsw_idx', 'cat_low', '=', q_cat_low::text);
-  ELSIF scenario = 'medium' THEN
-    PERFORM hnsw_set_filter('acorn_hnsw_idx', 'cat_med', '=', q_cat_med::text);
-  ELSIF scenario = 'high' THEN
-    PERFORM hnsw_set_filter('acorn_hnsw_idx', 'cat_high', '=', q_cat_high::text);
-  ELSIF scenario = 'range' THEN
-    PERFORM hnsw_set_filter('acorn_hnsw_idx', 'score', '>=', q_score_lo::text);
-    PERFORM hnsw_set_filter('acorn_hnsw_idx', 'score', '<=', q_score_hi::text);
-  ELSE
-    RAISE EXCEPTION 'unknown scenario: %', scenario;
-  END IF;
-
-  RETURN QUERY
-    SELECT id
-    FROM acorn_items
-    ORDER BY embedding <-> q_embedding
-    LIMIT k;
-
-  PERFORM hnsw_clear_filter('acorn_hnsw_idx');
-END;
-\$\$;
-SQL
-fi
 
 echo "run_id,mode,method,scenario,ef_search,clients,duration_s,repeat,transactions,tps,latency_avg_ms,latency_log_avg_ms,p50_ms,p95_ms,p99_ms" > "$METRICS_CSV"
 echo "run_id,mode,method,scenario,ef_search,recall_at_k,avg_exact_candidates,queries" > "$RECALL_CSV"

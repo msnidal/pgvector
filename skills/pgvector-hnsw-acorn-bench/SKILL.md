@@ -70,4 +70,4 @@ Each run writes to:
 
 - `quick` is intended for iteration.
 - `full` is intended for machine-level evaluation and can take a long time.
-- ACORN workload uses extension-side filters (`hnsw_set_filter`) inside each transaction.
+- ACORN workload uses native multicolumn key predicates in SQL (`WHERE` clauses on non-vector index keys).

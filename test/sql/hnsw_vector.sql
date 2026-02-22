@@ -87,78 +87,53 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
--- INCLUDE - build index
+-- multicolumn filtering - build index
 
 CREATE TABLE t (val vector(3), val2 int);
 INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2);
-CREATE INDEX ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops, val2);
 
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 >= 2 ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
--- INCLUDE - insert into index
+-- multicolumn filtering - insert into index
 
 CREATE TABLE t (val vector(3), val2 int);
-CREATE INDEX ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops, val2);
 
 INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2);
 
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 >= 2 AND val2 <= 3 ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
--- INCLUDE filters (extension-side ACORN predicates)
+-- multicolumn filters
 
 CREATE TABLE t (val vector(3), val2 int);
 INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2), ('[1,2,4]', 4);
-CREATE INDEX t_hnsw_idx ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
-
-BEGIN;
-SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '2');
-SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '<=', '3');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-COMMIT;
+CREATE INDEX t_hnsw_idx ON t USING hnsw (val vector_l2_ops, val2);
 
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-
-BEGIN;
-SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '=', '4');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-SELECT hnsw_clear_filter('t_hnsw_idx');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-COMMIT;
-
-BEGIN;
-SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '3');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-SELECT hnsw_clear_filters();
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-COMMIT;
-
-SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '!=', '2');
-BEGIN;
-SELECT hnsw_set_filter('t_hnsw_idx', 'missing', '=', '2');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-ROLLBACK;
-
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 >= 2 AND val2 <= 3 ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 = 4 ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 >= 3 ORDER BY val <-> '[3,3,3]';
+SELECT * FROM t WHERE val2 IS NULL ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
--- INCLUDE filters with fixed-length pass-by-reference type
+-- multicolumn filters with fixed-length pass-by-reference type
 
 CREATE TABLE t (val vector(3), ns uuid);
 INSERT INTO t (val, ns) VALUES
 	('[0,0,0]', '00000000-0000-0000-0000-000000000001'),
 	('[1,2,3]', '00000000-0000-0000-0000-000000000002'),
 	('[1,2,4]', '00000000-0000-0000-0000-000000000003');
-CREATE INDEX t_hnsw_uuid_idx ON t USING hnsw (val vector_l2_ops) INCLUDE (ns);
+CREATE INDEX t_hnsw_uuid_idx ON t USING hnsw (val vector_l2_ops, ns);
 
-BEGIN;
-SELECT hnsw_set_filter('t_hnsw_uuid_idx', 'ns', '=', '00000000-0000-0000-0000-000000000002');
-SELECT * FROM t ORDER BY val <-> '[3,3,3]';
-COMMIT;
+SELECT * FROM t WHERE ns = '00000000-0000-0000-0000-000000000002' ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 

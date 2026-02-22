@@ -37,6 +37,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/itup.h"
 #include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
@@ -187,7 +188,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Zero memory for each element */
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr), element->payloadSize);
+		if (HnswPtrAccess(base, element->itup) != NULL)
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, element->itup)));
+		else
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -415,7 +419,7 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, HnswEleme
 	char	   *base = buildstate->hnswarea;
 
 	/* Look for duplicate */
-	if (buildstate->numIncludes == 0 && FindDuplicateInMemory(base, element))
+	if (buildstate->indexInfo->ii_NumIndexAttrs == 1 && FindDuplicateInMemory(base, element))
 		return;
 
 	/* Add element */
@@ -545,8 +549,23 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 	/* Ok, we can proceed to allocate the element */
 	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
-	valuePtr = HnswAlloc(allocator, valueSize);
-	HnswSetElementPayloadFromValues(base, element, index, values, isnull, allocator);
+	if (buildstate->indexInfo->ii_NumIndexAttrs > 1)
+	{
+		bool		isnull1;
+		IndexTuple	itup = HnswFormIndexTuple(index, buildstate->tupdesc, value, values, isnull);
+		Size		itupSize = IndexTupleSize(itup);
+		IndexTuple	itupCopy = HnswAlloc(allocator, itupSize);
+
+		memcpy(itupCopy, itup, itupSize);
+		pfree(itup);
+
+		HnswPtrStore(base, element->itup, itupCopy);
+		HnswPtrStore(base, element->value, DatumGetPointer(index_getattr(itupCopy, 1, buildstate->tupdesc, &isnull1)));
+	}
+	else
+	{
+		valuePtr = HnswAlloc(allocator, valueSize);
+	}
 
 	/*
 	 * We have now allocated the space needed for the element, so we don't
@@ -556,8 +575,11 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	LWLockRelease(&graph->allocatorLock);
 
 	/* Copy the datum */
-	memcpy(valuePtr, DatumGetPointer(value), valueSize);
-	HnswPtrStore(base, element->value, valuePtr);
+	if (buildstate->indexInfo->ii_NumIndexAttrs == 1)
+	{
+		memcpy(valuePtr, DatumGetPointer(value), valueSize);
+		HnswPtrStore(base, element->value, valuePtr);
+	}
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -726,7 +748,9 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
-	buildstate->numIncludes = indexInfo->ii_NumIndexAttrs - indexInfo->ii_NumIndexKeyAttrs;
+	buildstate->tupdesc = NULL;
+	if (indexInfo->ii_NumIndexAttrs > 1)
+		buildstate->tupdesc = HnswTupleDesc(index);
 }
 
 /*
@@ -737,6 +761,8 @@ FreeBuildState(HnswBuildState * buildstate)
 {
 	MemoryContextDelete(buildstate->graphCtx);
 	MemoryContextDelete(buildstate->tmpCtx);
+	if (buildstate->tupdesc != NULL)
+		FreeTupleDesc(buildstate->tupdesc);
 }
 
 /*

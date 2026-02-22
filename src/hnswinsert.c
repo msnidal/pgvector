@@ -2,6 +2,7 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/itup.h"
 #include "hnsw.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
@@ -163,7 +164,10 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	uint8		tupleVersion;
 	char	   *base = NULL;
 
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)), e->payloadSize);
+	if (HnswPtrAccess(base, e->itup) != NULL)
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, e->itup)));
+	else
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -433,7 +437,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 		HnswQuery	q;
 
 		q.value = HnswGetValue(base, element);
-		q.filter = NULL;
+		q.scan = NULL;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
@@ -671,7 +675,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
 	/* Look for duplicate */
-	if (HnswGetNumPredicates(index) == 0 && FindDuplicateOnDisk(index, element, building))
+	if (IndexRelationGetNumberOfAttributes(index) == 1 && FindDuplicateOnDisk(index, element, building))
 		return;
 
 	/* Add element */
@@ -714,8 +718,18 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum 
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
-	HnswPtrStore(base, element->value, DatumGetPointer(value));
-	HnswSetElementPayloadFromValues(base, element, index, values, isnull, NULL);
+	if (IndexRelationGetNumberOfAttributes(index) > 1)
+	{
+		TupleDesc	tupdesc = HnswTupleDesc(index);
+		bool		isnull1;
+		IndexTuple	itup = HnswFormIndexTuple(index, tupdesc, value, values, isnull);
+
+		HnswPtrStore(base, element->itup, itup);
+		HnswPtrStore(base, element->value, DatumGetPointer(index_getattr(itup, 1, tupdesc, &isnull1)));
+		FreeTupleDesc(tupdesc);
+	}
+	else
+		HnswPtrStore(base, element->value, DatumGetPointer(value));
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)

@@ -443,6 +443,19 @@ Exact indexes work well for conditions that match a low percentage of rows. Othe
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
 ```
 
+For native predicate pushdown with HNSW, you can also use multicolumn HNSW indexes. Put the vector column first (for distance ordering), then add filter columns with HNSW scalar opclasses.
+
+```sql
+CREATE INDEX ON items USING hnsw (
+  embedding vector_l2_ops,
+  category_id vector_integer_ops,
+  tenant_id vector_bigint_ops,
+  namespace vector_uuid_ops
+);
+```
+
+This lets HNSW apply the `WHERE` predicates during scan key checks (instead of relying on extension-side filter APIs). Tradeoff: multicolumn HNSW indexes are larger than single-column vector indexes.
+
 With approximate indexes, filtering is applied *after* the index is scanned. If a condition matches 10% of rows, with HNSW and the default `hnsw.ef_search` of 40, only 4 rows will match on average. For more rows, increase `hnsw.ef_search`.
 
 ```sql
