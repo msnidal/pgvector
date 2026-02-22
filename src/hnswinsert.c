@@ -357,10 +357,13 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 {
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	{
+		pfree(indextids);
 		return neighbors;
+	}
 
 	for (int i = 0; i < lm; i++)
 	{
@@ -375,6 +378,8 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 		hc = &neighbors->items[neighbors->length++];
 		HnswPtrStore(base, hc->element, e);
 	}
+
+	pfree(indextids);
 
 	return neighbors;
 }
@@ -438,6 +443,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 
 		q.value = HnswGetValue(base, element);
 		q.scan = NULL;
+		q.baseM = m;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
@@ -702,6 +708,9 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum 
 	HnswElement entryPoint;
 	HnswElement element;
 	int			m;
+	int			acornGamma;
+	int			acornMBeta;
+	int			storageM;
 	int			efConstruction = HnswGetEfConstruction(index);
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
@@ -714,10 +723,11 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum 
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &acornGamma, &acornMBeta, &entryPoint);
+	storageM = HnswGetStorageM(m, acornGamma, acornMBeta);
 
 	/* Create an element */
-	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
+	element = HnswInitElement(base, heaptid, storageM, HnswGetMl(m), HnswGetMaxLevel(storageM), NULL);
 	if (IndexRelationGetNumberOfAttributes(index) > 1)
 	{
 		TupleDesc	tupdesc = HnswTupleDesc(index);
@@ -746,10 +756,10 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum 
 	}
 
 	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
+	HnswFindElementNeighbors(base, element, entryPoint, index, support, storageM, efConstruction, false);
 
 	/* Update graph on disk */
-	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);
+	UpdateGraphOnDisk(index, support, element, storageM, entryPoint, building);
 
 	/* Release lock */
 	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);

@@ -88,6 +88,10 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	add_int_reloption(hnsw_relopt_kind, "acorn_gamma", "ACORN-gamma neighbor expansion factor",
+					  HNSW_DEFAULT_ACORN_GAMMA, HNSW_MIN_ACORN_GAMMA, HNSW_MAX_ACORN_GAMMA, AccessExclusiveLock);
+	add_int_reloption(hnsw_relopt_kind, "acorn_m_beta", "ACORN-gamma compressed neighbor factor",
+					  HNSW_DEFAULT_ACORN_M_BETA, HNSW_MIN_ACORN_M_BETA, HNSW_MAX_ACORN_M_BETA, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -163,7 +167,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	genericcostestimate(root, path, loop_count, &costs);
 
 	index = index_open(path->indexinfo->indexoid, NoLock);
-	HnswGetMetaPageInfo(index, &m, NULL);
+	HnswGetMetaPageInfo(index, &m, NULL, NULL, NULL);
 	index_close(index, NoLock);
 
 	/*
@@ -240,6 +244,8 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(HnswOptions, acornGamma)},
+		{"acorn_m_beta", RELOPT_TYPE_INT, offsetof(HnswOptions, acornMBeta)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

@@ -105,6 +105,8 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->dimensions = buildstate->dimensions;
 	metap->m = buildstate->m;
 	metap->efConstruction = buildstate->efConstruction;
+	metap->acornGamma = buildstate->acornGamma;
+	metap->acornMBeta = buildstate->acornMBeta;
 	metap->entryBlkno = InvalidBlockNumber;
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
@@ -192,7 +194,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 			etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, element->itup)));
 		else
 			etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
-		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->storageM);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
@@ -257,7 +259,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
-	int			m = buildstate->m;
+	int			m = buildstate->storageM;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
 	HnswNeighborTuple ntup;
@@ -445,7 +447,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 	LWLock	   *entryLock = &graph->entryLock;
 	LWLock	   *entryWaitLock = &graph->entryWaitLock;
 	int			efConstruction = buildstate->efConstruction;
-	int			m = buildstate->m;
+	int			m = buildstate->storageM;
 	char	   *base = buildstate->hnswarea;
 
 	/* Wait if another process needs exclusive lock on entry lock */
@@ -548,7 +550,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	}
 
 	/* Ok, we can proceed to allocate the element */
-	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
+	element = HnswInitElement(base, heaptid, buildstate->storageM, buildstate->ml, buildstate->maxLevel, allocator);
 	if (buildstate->indexInfo->ii_NumIndexAttrs > 1)
 	{
 		bool		isnull1;
@@ -697,6 +699,10 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->typeInfo = HnswGetTypeInfo(index);
 
 	buildstate->m = HnswGetM(index);
+	buildstate->acornGamma = HnswGetAcornGamma(index);
+	buildstate->acornMBeta = HnswGetAcornMBeta(index);
+	buildstate->graphM = buildstate->m * buildstate->acornGamma;
+	buildstate->storageM = HnswGetStorageM(buildstate->m, buildstate->acornGamma, buildstate->acornMBeta);
 	buildstate->efConstruction = HnswGetEfConstruction(index);
 	buildstate->dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
 
@@ -722,6 +728,17 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("ef_construction must be greater than or equal to 2 * m")));
 
+	if (buildstate->acornMBeta > 0 && buildstate->acornMBeta > buildstate->acornGamma)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("acorn_m_beta must be less than or equal to acorn_gamma")));
+
+	if (HNSW_NEIGHBOR_TUPLE_SIZE(0, buildstate->storageM) > HNSW_TUPLE_ALLOC_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("acorn_gamma and acorn_m_beta are too large for m"),
+				 errhint("Reduce acorn_gamma, acorn_m_beta, or m.")));
+
 	buildstate->reltuples = 0;
 	buildstate->indtuples = 0;
 
@@ -731,7 +748,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
 	buildstate->graph = &buildstate->graphData;
 	buildstate->ml = HnswGetMl(buildstate->m);
-	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+	buildstate->maxLevel = HnswGetMaxLevel(buildstate->storageM);
 
 	buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
 												   "Hnsw build graph context",

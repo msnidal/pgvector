@@ -61,6 +61,8 @@ skills/pgvector-hnsw-acorn-bench/scripts/compare-acorn-tradeoff-runs.sh \
 - `--clients 1,8,32`
 - `--scenarios low,medium,high,range`
 - `--io-probe-queries N`
+- `--acorn-gamma N`
+- `--acorn-m-beta N`
 - `--seed FLOAT`
 - `--shared-buffers VALUE`
 - `--skip-build`
@@ -72,6 +74,8 @@ skills/pgvector-hnsw-acorn-bench/scripts/compare-acorn-tradeoff-runs.sh \
 - `PGVECTOR_BENCH_SKIP_BUILD` (`1` skips make/install)
 - `PGVECTOR_BENCH_KEEP_DATA` (`1` keeps cluster data dir)
 - `PGVECTOR_BENCH_SHARED_BUFFERS` (default `64MB`)
+- `PGVECTOR_BENCH_ACORN_GAMMA` (default `1`)
+- `PGVECTOR_BENCH_ACORN_M_BETA` (default `0`)
 - `PGVECTOR_BENCH_SEED` (default `0.42`)
 
 ## Artifacts

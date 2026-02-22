@@ -29,15 +29,23 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	List	   *ep;
 	List	   *w;
 	int			m;
+	int			acornGamma;
+	int			acornMBeta;
+	int			graphM;
+	int			storageM;
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
-	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	/* Get m, ACORN-gamma, and entry point */
+	HnswGetMetaPageInfo(index, &m, &acornGamma, &acornMBeta, &entryPoint);
+	graphM = m * acornGamma;
+	storageM = HnswGetStorageM(m, acornGamma, acornMBeta);
 
 	q->value = value;
-	so->m = m;
+	q->baseM = m;
+	q->graphM = graphM;
+	so->m = storageM;
 
 	if (entryPoint == NULL)
 		return NIL;
@@ -46,11 +54,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, storageM, false, NULL, NULL, NULL, true, NULL);
 		ep = w;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, storageM, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
 }
 
 /*
@@ -153,6 +161,8 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
 	so->q.scan = NULL;
+	so->q.baseM = 0;
+	so->q.graphM = 0;
 
 	scan->opaque = so;
 
@@ -175,6 +185,8 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
 	so->q.scan = NULL;
+	so->q.baseM = 0;
+	so->q.graphM = 0;
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));

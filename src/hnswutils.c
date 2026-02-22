@@ -129,6 +129,45 @@ HnswGetM(Relation index)
 }
 
 /*
+ * Get the ACORN-gamma neighbor expansion factor in the index
+ */
+int
+HnswGetAcornGamma(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts && opts->acornGamma > 0)
+		return opts->acornGamma;
+
+	return HNSW_DEFAULT_ACORN_GAMMA;
+}
+
+/*
+ * Get the ACORN-gamma compressed neighbor factor in the index
+ */
+int
+HnswGetAcornMBeta(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts && opts->acornMBeta > 0)
+		return opts->acornMBeta;
+
+	return HNSW_DEFAULT_ACORN_M_BETA;
+}
+
+/*
+ * Get effective per-layer connectivity stored on disk
+ */
+int
+HnswGetStorageM(int m, int acornGamma, int acornMBeta)
+{
+	int			beta = acornMBeta > 0 ? Min(acornMBeta, acornGamma) : acornGamma;
+
+	return m * beta;
+}
+
+/*
  * Get the size of the dynamic candidate list in the index
  */
 int
@@ -306,7 +345,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, int *acornGamma, int *acornMBeta, HnswElement * entryPoint)
 {
 	Buffer		buf;
 	Page		page;
@@ -320,8 +359,27 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
 
+	if (unlikely(metap->version < 1 || metap->version > HNSW_VERSION))
+		elog(ERROR, "hnsw index version not supported");
+
 	if (m != NULL)
 		*m = metap->m;
+
+	if (acornGamma != NULL)
+	{
+		if (metap->version >= 2 && metap->acornGamma > 0)
+			*acornGamma = metap->acornGamma;
+		else
+			*acornGamma = HNSW_DEFAULT_ACORN_GAMMA;
+	}
+
+	if (acornMBeta != NULL)
+	{
+		if (metap->version >= 3 && metap->acornMBeta > 0)
+			*acornMBeta = metap->acornMBeta;
+		else
+			*acornMBeta = HNSW_DEFAULT_ACORN_M_BETA;
+	}
 
 	if (entryPoint != NULL)
 	{
@@ -345,7 +403,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, NULL, NULL, &entryPoint);
 
 	return entryPoint;
 }
@@ -864,7 +922,7 @@ CountElement(HnswElement skipElement, HnswElement e)
  * Load unvisited neighbors from memory
  */
 static void
-HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize)
+HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize, int maxNeighbors)
 {
 	/* Get the neighborhood at layer lc */
 	HnswNeighborArray *neighborhood = HnswGetNeighbors(base, element, lc);
@@ -876,7 +934,7 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
 
 	*unvisitedLength = 0;
 
-	for (int i = 0; i < localNeighborhood->length; i++)
+	for (int i = 0; i < localNeighborhood->length && i < maxNeighbors; i++)
 	{
 		HnswCandidate *hc = &localNeighborhood->items[i];
 		bool		found;
@@ -927,14 +985,17 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
  * Load unvisited neighbors from disk
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, bool expand, int maxUnvisited)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, int maxUnvisited)
 {
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
 
 	*unvisitedLength = 0;
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	{
+		pfree(indextids);
 		return;
+	}
 
 	for (int i = 0; i < lm; i++)
 	{
@@ -948,58 +1009,62 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 		if (!found && *unvisitedLength < maxUnvisited)
 			unvisited[(*unvisitedLength)++].indextid = *indextid;
+	}
 
-		if (!expand)
-			continue;
+	pfree(indextids);
+}
 
-		if (*unvisitedLength >= maxUnvisited)
+/*
+ * Append unvisited neighbors from disk for a loaded element
+ */
+static void
+HnswAppendUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, int maxUnvisited)
+{
+	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
+
+	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	{
+		pfree(indextids);
+		return;
+	}
+
+	for (int i = 0; i < lm && *unvisitedLength < maxUnvisited; i++)
+	{
+		ItemPointer indextid = &indextids[i];
+		bool		found;
+
+		if (!ItemPointerIsValid(indextid))
 			break;
 
-		{
-			Buffer		ebuf;
-			Page		epage;
-			HnswElementTuple etup;
-			HnswElement secondHop = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
-			ItemPointerData secondTids[HNSW_MAX_M * 2];
+		tidhash_insert(v->tids, *indextid, &found);
 
-			ebuf = ReadBuffer(index, ItemPointerGetBlockNumber(indextid));
-			LockBuffer(ebuf, BUFFER_LOCK_SHARE);
-			epage = BufferGetPage(ebuf);
-			etup = (HnswElementTuple) PageGetItem(epage, PageGetItemId(epage, ItemPointerGetOffsetNumber(indextid)));
+		if (!found)
+			unvisited[(*unvisitedLength)++].indextid = *indextid;
+	}
 
-			if (!HnswIsElementTuple(etup))
-			{
-				UnlockReleaseBuffer(ebuf);
-				pfree(secondHop);
-				continue;
-			}
+	pfree(indextids);
+}
 
-			HnswLoadElementFromTuple(secondHop, etup, false, false, index);
+/*
+ * Hybrid expansion for ACORN-gamma compressed neighborhoods
+ */
+static void
+HnswExpandUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int targetLm, int lc)
+{
+	int			firstHop = *unvisitedLength;
 
-			UnlockReleaseBuffer(ebuf);
+	for (int i = 0; i < firstHop && *unvisitedLength < targetLm; i++)
+	{
+		ItemPointer indextid = &unvisited[i].indextid;
+		HnswElement neighbor;
 
-			if (HnswLoadNeighborTids(secondHop, secondTids, index, m, lm, lc))
-			{
-				for (int j = 0; j < lm; j++)
-				{
-					ItemPointer secondTid = &secondTids[j];
-					bool		secondFound;
+		neighbor = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
+		HnswLoadElement(neighbor, NULL, NULL, index, support, false, NULL);
 
-					if (!ItemPointerIsValid(secondTid))
-						break;
+		if (neighbor->level >= lc)
+			HnswAppendUnvisitedFromDisk(neighbor, unvisited, unvisitedLength, v, index, m, lm, lc, targetLm);
 
-					tidhash_insert(v->tids, *secondTid, &secondFound);
-
-					if (!secondFound && *unvisitedLength < maxUnvisited)
-						unvisited[(*unvisitedLength)++].indextid = *secondTid;
-
-					if (*unvisitedLength >= maxUnvisited)
-						break;
-				}
-			}
-
-			pfree(secondHop);
-		}
+		pfree(neighbor);
 	}
 }
 
@@ -1017,10 +1082,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
-	int			lm = HnswGetLayerM(m, lc);
+	int			storedLm = HnswGetLayerM(m, lc);
+	int			targetM = q != NULL && q->graphM > 0 ? q->graphM : m;
+	int			targetLm = HnswGetLayerM(targetM, lc);
+	int			baseM = q != NULL && q->baseM > 0 ? q->baseM : m;
+	int			baseLm = HnswGetLayerM(baseM, lc);
 	bool		inMemory = index == NULL;
 	bool		acornFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
-	int			maxUnvisited = inMemory ? lm : (acornFilter ? lm + (lm * lm) : lm);
+	int			scanLm = acornFilter ? storedLm : Min(baseLm, storedLm);
+	int			maxUnvisited = acornFilter ? Max(storedLm, targetLm) : scanLm;
 	HnswUnvisited *unvisited = palloc(maxUnvisited * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 
@@ -1041,7 +1111,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	/* Create local memory for neighborhood if needed */
 	if (inMemory)
 	{
-		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(storedLm);
 		localNeighborhood = palloc(neighborhoodSize);
 	}
 
@@ -1078,7 +1148,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
 		int			filteredLength = 0;
-		int			maxFilteredLength = acornFilter ? m : lm;
+		int			maxFilteredLength = acornFilter ? baseM : scanLm;
 
 		if (c->distance > f->distance)
 			break;
@@ -1086,9 +1156,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		cElement = HnswPtrAccess(base, c->element);
 
 		if (inMemory)
-			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize, scanLm);
 		else
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, acornFilter, maxUnvisited);
+		{
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, scanLm, lc, maxUnvisited);
+
+			if (acornFilter && targetLm > scanLm && unvisitedLength < targetLm)
+				HnswExpandUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, support, m, scanLm, targetLm, lc);
+		}
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -1488,6 +1563,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 	q.value = HnswGetValue(base, element);
 	q.scan = NULL;
+	q.baseM = m;
+	q.graphM = m;
 
 	/* Precompute hash */
 	if (inMemory)
