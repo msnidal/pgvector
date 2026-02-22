@@ -66,7 +66,7 @@ typedef Pointer Item;
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
-#define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+#define HNSW_ELEMENT_TUPLE_SIZE(size, predicatesSize)  MAXALIGN(offsetof(HnswElementTupleData, data) + (size) + (predicatesSize))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
@@ -157,6 +157,7 @@ struct HnswElementData
 	BlockNumber neighborPage;
 	DatumPtr	value;
 	LWLock		lock;
+	DatumPtr  predicateValues[FLEXIBLE_ARRAY_MEMBER];
 };
 
 typedef HnswElementData * HnswElement;
@@ -267,6 +268,7 @@ typedef struct HnswSupport
 typedef struct HnswQuery
 {
 	Datum		value;
+	Datum   *predicateValues;
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -305,6 +307,10 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+
+	/* Predicate filtering */
+	int 	 numPredicates;
+	Oid 	*predicateOids;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -341,6 +347,7 @@ typedef struct HnswElementTupleData
 	ItemPointerData neighbortid;
 	uint16		unused;
 	Vector		data;
+	Datum 		predicateData[FLEXIBLE_ARRAY_MEMBER];
 }			HnswElementTupleData;
 
 typedef HnswElementTupleData * HnswElementTuple;
@@ -384,6 +391,10 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* Filtering state */
+	bool   hasPredicateFilters;
+	int 	 numPredicates;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -427,8 +438,8 @@ List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Re
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
-HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
+HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc, int numPredicates);
+HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno, int numPredicates);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
@@ -438,15 +449,16 @@ HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
 bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
-void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
+void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, int numPredicates);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
-void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
+void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, int numPredicates, Oid *predicateOids);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+int  		HnswGetNumPredicates(Relation index);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);

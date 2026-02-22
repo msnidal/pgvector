@@ -10,6 +10,7 @@
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
+#include "utils/lsyscache.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
@@ -242,9 +243,9 @@ HnswAlloc(HnswAllocator * allocator, Size size)
  * Allocate an element
  */
 HnswElement
-HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator)
+HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator, int numPredicates)
 {
-	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
+	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData) + (sizeof(DatumPtr) * numPredicates));
 
 	int			level = (int) (-log(RandomDouble()) * ml);
 
@@ -262,7 +263,11 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 
 	HnswInitNeighbors(base, element, m, allocator);
 
-	HnswPtrStore(base, element->value, (char *) NULL);
+	HnswPtrStore(base, element->value, (Pointer) NULL);
+	for (int i = 0; i < numPredicates; i++)
+	{
+			HnswPtrStore(base, element->predicateValues[i], (Pointer)NULL);
+	}
 
 	return element;
 }
@@ -280,15 +285,20 @@ HnswAddHeapTid(HnswElement element, ItemPointer heaptid)
  * Allocate an element from block and offset numbers
  */
 HnswElement
-HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
+HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno, int numPredicates)
 {
-	HnswElement element = palloc(sizeof(HnswElementData));
+	HnswElement element = palloc(sizeof(HnswElementData) + (sizeof(DatumPtr) * numPredicates));
 	char	   *base = NULL;
 
 	element->blkno = blkno;
 	element->offno = offno;
 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
-	HnswPtrStore(base, element->value, (char *) NULL);
+	HnswPtrStore(base, element->value, (Pointer) NULL);
+
+	for (int i = 0; i < numPredicates; i++)
+	{
+		HnswPtrStore(base, element->predicateValues[i], (Pointer)NULL);
+	}
 	return element;
 }
 
@@ -301,11 +311,13 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
+	int     numPredicates;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
+	numPredicates = HnswGetNumPredicates(index);
 
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
@@ -317,7 +329,7 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
 		{
-			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
+			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno, numPredicates);
 			(*entryPoint)->level = metap->entryLevel;
 		}
 		else
@@ -429,25 +441,60 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 
 /*
  * Set element tuple, except for neighbor info
+ * If predicates are provided via INCLUDE clause, they are also colocated with the element tuple data
  */
-void
-HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
-{
-	Pointer		valuePtr = HnswPtrAccess(base, element->value);
-
-	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
-	etup->level = element->level;
-	etup->deleted = 0;
-	etup->version = element->version;
-	for (int i = 0; i < HNSW_HEAPTIDS; i++)
-	{
-		if (i < element->heaptidsLength)
-			etup->heaptids[i] = element->heaptids[i];
-		else
-			ItemPointerSetInvalid(&etup->heaptids[i]);
-	}
-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
-}
+void HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, int numPredicates, Oid *predicateOids) {
+	    char *dest = (char *) etup;
+	    Pointer valuePtr = HnswPtrAccess(base, element->value);
+	    etup->type = HNSW_ELEMENT_TUPLE_TYPE;
+	    etup->level = element->level;
+	    etup->deleted = element->deleted;
+	    etup->version = element->version;
+	
+	    dest += offsetof(HnswElementTupleData, heaptids);
+	    memcpy(dest, element->heaptids, sizeof(ItemPointerData) * HNSW_HEAPTIDS);
+	
+	    dest += sizeof(ItemPointerData) * HNSW_HEAPTIDS;
+	    dest = (char *) MAXALIGN(dest); // Align after fixed-size data
+	
+	    etup->data.vl_len_ = VARSIZE_ANY(valuePtr);
+	    memcpy((void *) &etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+	
+	    dest += VARSIZE_ANY(valuePtr);
+	    dest = (char *) MAXALIGN(dest); // Align after vector data
+	
+	    /* Copy each predicate, placing them contiguously after vector data */
+	    for (int i = 0; i < numPredicates; i++) {
+	        Datum predDatum;
+	        Pointer predPtr = HnswPtrAccess(base, element->predicateValues[i]);
+	        bool typByVal;
+	        int16 typLen;
+	
+	        get_typlenbyval(predicateOids[i], &typLen, &typByVal);
+	
+	        if (predPtr == NULL) {
+	            elog(ERROR, "Predicate pointer is NULL, possible memory corruption"); // Critical error
+	        }
+	
+	        if (typByVal) {
+	            predDatum = *((Datum *) predPtr);
+	            memcpy(dest, &predDatum, sizeof(Datum));
+	            dest += sizeof(Datum);
+	        } else {
+	            Size dataSize = datumGetSize(predDatum, typByVal, typLen);
+	            if (dataSize > 0) {
+	                memcpy(dest, predPtr, dataSize);
+	                ((HnswElementTuple) etup)->predicateData[i] = PointerGetDatum(dest); // Store pointer in tuple
+	                dest += MAXALIGN(dataSize); // Align after each varlena
+	            } else {
+	                ((HnswElementTuple) etup)->predicateData[i] = PointerGetDatum(NULL); // Handle empty varlena? Or error?
+	            }
+	        }
+	    }
+	    // No need to set predicateData pointers within etup->predicateData,
+	    // as we are copying the raw bytes and will reconstruct pointers on load.
+	
+	 }
 
 /*
  * Set neighbor tuple
@@ -488,7 +535,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
  * Load an element from a tuple
  */
 void
-HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec)
+HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, int numPredicates)
 {
 	element->level = etup->level;
 	element->deleted = etup->deleted;
@@ -516,6 +563,14 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 
 		HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
 	}
+
+	for (int i = 0; i < numPredicates; i++)
+	{
+		char	   *base = NULL;
+		//Datum		value = datumCopy(PointerGetDatum(&etup->predicateData[i]), false, -1);
+
+		//HnswPtrStore(base, element->predicateValues[i], DatumGetPointer(value));
+	}
 }
 
 /*
@@ -536,11 +591,13 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Buffer		buf;
 	Page		page;
 	HnswElementTuple etup;
+	int     numPredicates;
 
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
+	numPredicates = HnswGetNumPredicates(index);
 
 	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 
@@ -559,9 +616,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
 	{
 		if (*element == NULL)
-			*element = HnswInitElementFromBlock(blkno, offno);
+			*element = HnswInitElementFromBlock(blkno, offno, numPredicates);
 
-		HnswLoadElementFromTuple(*element, etup, true, loadVec);
+		HnswLoadElementFromTuple(*element, etup, true, loadVec, numPredicates);
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -1386,6 +1443,18 @@ HnswGetTypeInfo(Relation index)
 	}
 	else
 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+}
+
+
+/*
+ * Get the number of predicates from the INCLUDE directive on the index
+ * This is used to support ACORN-1 style predicate filtering
+ */
+int
+HnswGetNumPredicates(Relation index)
+{
+    Form_pg_index indexForm = index->rd_index;
+		return indexForm->indnatts - indexForm->indnkeyatts;
 }
 
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_support);

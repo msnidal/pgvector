@@ -87,6 +87,27 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
+-- INCLUDE - build index
+
+CREATE TABLE t (val vector(3), val2 int);
+INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+
+DROP TABLE t;
+
+-- INCLUDE - insert into index
+
+CREATE TABLE t (val vector(3), val2 int);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+
+INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2);
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+
+DROP TABLE t;
+
 -- options
 
 CREATE TABLE t (val vector(3));
