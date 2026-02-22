@@ -836,12 +836,46 @@ SELECT i,
        GREATEST(score - ${SCORE_BAND}, 0),
        LEAST(score + ${SCORE_BAND}, ${SCORE_CARD} - 1)
 FROM q;
+SQL
+
+ACORN_SUPPORTED="$(PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'hnsw_set_filter')")"
+
+if [ "$ACORN_SUPPORTED" != "t" ]; then
+  echo "ACORN filter functions not available; running where-only benchmark"
+  FILTERED_METHODS=()
+
+  for method in "${METHODS[@]}"; do
+    if [ "$method" = "where" ]; then
+      FILTERED_METHODS+=("$method")
+    fi
+  done
+
+  METHODS=("${FILTERED_METHODS[@]}")
+
+  if [ "${#METHODS[@]}" -eq 0 ]; then
+    echo "No runnable methods available on this branch (ACORN unsupported and where method disabled)" >&2
+    exit 1
+  fi
+fi
+
+METHOD_LIST="$(IFS=,; echo "${METHODS[*]}")"
+
+INDEX_INCLUDE=""
+if [ "$ACORN_SUPPORTED" = "t" ]; then
+  INDEX_INCLUDE=" INCLUDE (cat_low, cat_med, cat_high, score)"
+fi
+
+PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" <<SQL
 
 SET maintenance_work_mem = '${MAINTENANCE_WORK_MEM}';
-CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops) INCLUDE (cat_low, cat_med, cat_high, score);
+CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops)${INDEX_INCLUDE};
 
 ANALYZE acorn_items;
 ANALYZE acorn_queries;
+SQL
+
+if [ "$ACORN_SUPPORTED" = "t" ]; then
+  PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" <<SQL
 
 CREATE OR REPLACE FUNCTION acorn_bench_acorn_search(
   q_embedding vector,
@@ -879,6 +913,7 @@ BEGIN
 END;
 \$\$;
 SQL
+fi
 
 echo "run_id,mode,method,scenario,ef_search,clients,duration_s,repeat,transactions,tps,latency_avg_ms,latency_log_avg_ms,p50_ms,p95_ms,p99_ms" > "$METRICS_CSV"
 echo "run_id,mode,method,scenario,ef_search,recall_at_k,avg_exact_candidates,queries" > "$RECALL_CSV"
@@ -897,6 +932,7 @@ echo "run_id,mode,method,scenario,ef_search,recall_at_k,avg_exact_candidates,que
   echo "clients=${CLIENT_LIST}"
   echo "scenarios=${SCENARIO_LIST}"
   echo "methods=${METHOD_LIST}"
+  echo "acorn_supported=${ACORN_SUPPORTED}"
   echo "socket_dir=${SOCKET_DIR}"
   echo "port=${PORT}"
   echo "git_head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
