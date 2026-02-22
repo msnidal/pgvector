@@ -24,8 +24,6 @@ Options:
   --clients A,B,C              Client counts (comma separated)
   --scenarios A,B,C            Scenarios: low,medium,high,range
   --methods A,B                Methods: acorn,post (where aliases acorn)
-  --acorn-gamma N              HNSW acorn_gamma index option (default: 1)
-  --acorn-m-beta N             HNSW acorn_m_beta index option (default: 0)
   --seed FLOAT                 setseed() value for deterministic synthetic data
   --port N                     Isolated PostgreSQL port
   --shared-buffers VALUE       PostgreSQL shared_buffers value (default: 64MB)
@@ -40,8 +38,6 @@ Environment overrides:
   PGVECTOR_BENCH_SKIP_BUILD
   PGVECTOR_BENCH_KEEP_DATA
   PGVECTOR_BENCH_SHARED_BUFFERS
-  PGVECTOR_BENCH_ACORN_GAMMA
-  PGVECTOR_BENCH_ACORN_M_BETA
   PGVECTOR_BENCH_SEED
 EOF
 }
@@ -627,16 +623,12 @@ METHOD_LIST_OVERRIDE=""
 PORT_OVERRIDE=""
 SHARED_BUFFERS_OVERRIDE=""
 SEED_OVERRIDE=""
-ACORN_GAMMA_OVERRIDE=""
-ACORN_M_BETA_OVERRIDE=""
 
 SKIP_BUILD="${PGVECTOR_BENCH_SKIP_BUILD:-0}"
 KEEP_DATA="${PGVECTOR_BENCH_KEEP_DATA:-0}"
 PORT="${PGVECTOR_BENCH_PORT:-6546}"
 PGUSER_NAME="${PGVECTOR_BENCH_USER:-${USER}}"
 SHARED_BUFFERS="${PGVECTOR_BENCH_SHARED_BUFFERS:-64MB}"
-ACORN_GAMMA="${PGVECTOR_BENCH_ACORN_GAMMA:-1}"
-ACORN_M_BETA="${PGVECTOR_BENCH_ACORN_M_BETA:-0}"
 SEED="${PGVECTOR_BENCH_SEED:-0.42}"
 
 while [ "$#" -gt 0 ]; do
@@ -691,14 +683,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --methods)
       METHOD_LIST_OVERRIDE="$2"
-      shift 2
-      ;;
-    --acorn-gamma)
-      ACORN_GAMMA_OVERRIDE="$2"
-      shift 2
-      ;;
-    --acorn-m-beta)
-      ACORN_M_BETA_OVERRIDE="$2"
       shift 2
       ;;
     --port)
@@ -786,14 +770,6 @@ fi
 
 if [ -n "$PORT_OVERRIDE" ]; then
   PORT="$PORT_OVERRIDE"
-fi
-
-if [ -n "$ACORN_GAMMA_OVERRIDE" ]; then
-  ACORN_GAMMA="$ACORN_GAMMA_OVERRIDE"
-fi
-
-if [ -n "$ACORN_M_BETA_OVERRIDE" ]; then
-  ACORN_M_BETA="$ACORN_M_BETA_OVERRIDE"
 fi
 
 if [ -n "$SEED_OVERRIDE" ]; then
@@ -1074,7 +1050,7 @@ record_index_metrics "vector_only" "acorn_hnsw_vector_only_idx" "$(elapsed_secs 
 PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "DROP INDEX IF EXISTS acorn_hnsw_vector_only_idx;"
 
 start_time="$(now_epoch)"
-PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "SET maintenance_work_mem = '${MAINTENANCE_WORK_MEM}'; CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops, cat_low vector_integer_ops, cat_med vector_integer_ops, cat_high vector_integer_ops, score vector_integer_ops) WITH (acorn_gamma = ${ACORN_GAMMA}, acorn_m_beta = ${ACORN_M_BETA});"
+PGHOST="$SOCKET_DIR" PGPORT="$PORT" PGUSER="$PGUSER_NAME" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" -U "$PGUSER_NAME" "$DB_NAME" -c "SET maintenance_work_mem = '${MAINTENANCE_WORK_MEM}'; CREATE INDEX acorn_hnsw_idx ON acorn_items USING hnsw (embedding vector_l2_ops, cat_low vector_integer_ops, cat_med vector_integer_ops, cat_high vector_integer_ops, score vector_integer_ops);"
 end_time="$(now_epoch)"
 record_index_metrics "acorn_multicol" "acorn_hnsw_idx" "$(elapsed_secs "$start_time" "$end_time")"
 
@@ -1113,8 +1089,6 @@ METHOD_LIST="$(IFS=,; echo "${METHODS[*]}")"
   echo "scenarios=${SCENARIO_LIST}"
   echo "methods=${METHOD_LIST}"
   echo "acorn_supported=${ACORN_SUPPORTED}"
-  echo "acorn_gamma=${ACORN_GAMMA}"
-  echo "acorn_m_beta=${ACORN_M_BETA}"
   echo "shared_buffers=${SHARED_BUFFERS}"
   echo "seed=${SEED}"
   echo "socket_dir=${SOCKET_DIR}"

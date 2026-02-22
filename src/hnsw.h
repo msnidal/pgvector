@@ -27,7 +27,7 @@ typedef Pointer Item;
 #define HNSW_NORM_PROC 2
 #define HNSW_TYPE_INFO_PROC 3
 
-#define HNSW_VERSION	3
+#define HNSW_VERSION	1
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
@@ -49,12 +49,6 @@ typedef Pointer Item;
 #define HNSW_DEFAULT_EF_SEARCH	40
 #define HNSW_MIN_EF_SEARCH		1
 #define HNSW_MAX_EF_SEARCH		1000
-#define HNSW_DEFAULT_ACORN_GAMMA	1
-#define HNSW_MIN_ACORN_GAMMA	1
-#define HNSW_MAX_ACORN_GAMMA	32
-#define HNSW_DEFAULT_ACORN_M_BETA	0
-#define HNSW_MIN_ACORN_M_BETA	0
-#define HNSW_MAX_ACORN_M_BETA	32
 
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
@@ -188,6 +182,7 @@ typedef struct HnswSearchCandidate
 {
 	pairingheap_node c_node;
 	pairingheap_node w_node;
+	pairingheap_node m_node;
 	HnswElementPtr element;
 	double		distance;
 }			HnswSearchCandidate;
@@ -198,8 +193,6 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
-	int			acornGamma;		/* ACORN-gamma neighbor expansion factor */
-	int			acornMBeta;		/* ACORN-gamma compressed neighbor factor */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -279,8 +272,6 @@ typedef struct HnswQuery
 {
 	Datum		value;
 	IndexScanDesc scan;
-	int			baseM;
-	int			graphM;
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -295,10 +286,6 @@ typedef struct HnswBuildState
 	/* Settings */
 	int			dimensions;
 	int			m;
-	int			acornGamma;
-	int			acornMBeta;
-	int			graphM;
-	int			storageM;
 	int			efConstruction;
 
 	/* Statistics */
@@ -339,8 +326,6 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
-	uint16		acornGamma;
-	uint16		acornMBeta;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -421,7 +406,6 @@ typedef struct HnswVacuumState
 
 	/* Settings */
 	int			m;
-	int			acornGamma;
 	int			efConstruction;
 
 	/* Support functions */
@@ -439,9 +423,6 @@ typedef struct HnswVacuumState
 
 /* Methods */
 int			HnswGetM(Relation index);
-int			HnswGetAcornGamma(Relation index);
-int			HnswGetAcornMBeta(Relation index);
-int			HnswGetStorageM(int m, int acornGamma, int acornMBeta);
 int			HnswGetEfConstruction(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
@@ -452,7 +433,7 @@ void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
-void		HnswGetMetaPageInfo(Relation index, int *m, int *acornGamma, int *acornMBeta, HnswElement * entryPoint);
+void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);

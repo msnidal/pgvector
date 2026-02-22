@@ -586,7 +586,6 @@ static void
 InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
-	int			acornMBeta;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -604,9 +603,8 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 
 	HnswInitSupport(&vacuumstate->support, index);
 
-	/* Get m and ACORN settings from metapage */
-	HnswGetMetaPageInfo(index, &vacuumstate->m, &vacuumstate->acornGamma, &acornMBeta, NULL);
-	vacuumstate->m = HnswGetStorageM(vacuumstate->m, vacuumstate->acornGamma, acornMBeta);
+	/* Get m from metapage */
+	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL);
 
 	/* Create hash table */
 	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);

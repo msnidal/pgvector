@@ -129,45 +129,6 @@ HnswGetM(Relation index)
 }
 
 /*
- * Get the ACORN-gamma neighbor expansion factor in the index
- */
-int
-HnswGetAcornGamma(Relation index)
-{
-	HnswOptions *opts = (HnswOptions *) index->rd_options;
-
-	if (opts && opts->acornGamma > 0)
-		return opts->acornGamma;
-
-	return HNSW_DEFAULT_ACORN_GAMMA;
-}
-
-/*
- * Get the ACORN-gamma compressed neighbor factor in the index
- */
-int
-HnswGetAcornMBeta(Relation index)
-{
-	HnswOptions *opts = (HnswOptions *) index->rd_options;
-
-	if (opts && opts->acornMBeta > 0)
-		return opts->acornMBeta;
-
-	return HNSW_DEFAULT_ACORN_M_BETA;
-}
-
-/*
- * Get effective per-layer connectivity stored on disk
- */
-int
-HnswGetStorageM(int m, int acornGamma, int acornMBeta)
-{
-	int			beta = acornMBeta > 0 ? Min(acornMBeta, acornGamma) : acornGamma;
-
-	return m * beta;
-}
-
-/*
  * Get the size of the dynamic candidate list in the index
  */
 int
@@ -345,7 +306,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, int *acornGamma, int *acornMBeta, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 {
 	Buffer		buf;
 	Page		page;
@@ -359,27 +320,8 @@ HnswGetMetaPageInfo(Relation index, int *m, int *acornGamma, int *acornMBeta, Hn
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
 
-	if (unlikely(metap->version < 1 || metap->version > HNSW_VERSION))
-		elog(ERROR, "hnsw index version not supported");
-
 	if (m != NULL)
 		*m = metap->m;
-
-	if (acornGamma != NULL)
-	{
-		if (metap->version >= 2 && metap->acornGamma > 0)
-			*acornGamma = metap->acornGamma;
-		else
-			*acornGamma = HNSW_DEFAULT_ACORN_GAMMA;
-	}
-
-	if (acornMBeta != NULL)
-	{
-		if (metap->version >= 3 && metap->acornMBeta > 0)
-			*acornMBeta = metap->acornMBeta;
-		else
-			*acornMBeta = HNSW_DEFAULT_ACORN_M_BETA;
-	}
 
 	if (entryPoint != NULL)
 	{
@@ -403,7 +345,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, NULL, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, &entryPoint);
 
 	return entryPoint;
 }
@@ -688,12 +630,13 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
  * Load an element and optionally get its distance from q
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, IndexScanDesc filterScan)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, IndexScanDesc scan, bool *matches)
 {
 	Buffer		buf;
 	Page		page;
 	ItemId		itemid;
 	HnswElementTuple etup;
+	bool		tupleMatches = true;
 
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
@@ -704,11 +647,11 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 	Assert(HnswIsElementTuple(etup));
 
-	if (filterScan != NULL && !HnswCheckMatches(index, etup, filterScan))
-	{
-		UnlockReleaseBuffer(buf);
-		return;
-	}
+	if (scan != NULL)
+		tupleMatches = HnswCheckMatches(index, etup, scan);
+
+	if (matches != NULL)
+		*matches = tupleMatches;
 
 	/* Calculate distance */
 	if (distance != NULL)
@@ -747,7 +690,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL, NULL);
 }
 
 bool
@@ -853,6 +796,21 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 		return -1;
 
 	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Compare matched candidate distances
+ */
+static int
+CompareFurthestMatchedCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	if (HnswGetSearchCandidateConst(m_node, a)->distance < HnswGetSearchCandidateConst(m_node, b)->distance)
+		return -1;
+
+	if (HnswGetSearchCandidateConst(m_node, a)->distance > HnswGetSearchCandidateConst(m_node, b)->distance)
 		return 1;
 
 	return 0;
@@ -1015,60 +973,6 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 }
 
 /*
- * Append unvisited neighbors from disk for a loaded element
- */
-static void
-HnswAppendUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, int maxUnvisited)
-{
-	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
-
-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
-	{
-		pfree(indextids);
-		return;
-	}
-
-	for (int i = 0; i < lm && *unvisitedLength < maxUnvisited; i++)
-	{
-		ItemPointer indextid = &indextids[i];
-		bool		found;
-
-		if (!ItemPointerIsValid(indextid))
-			break;
-
-		tidhash_insert(v->tids, *indextid, &found);
-
-		if (!found)
-			unvisited[(*unvisitedLength)++].indextid = *indextid;
-	}
-
-	pfree(indextids);
-}
-
-/*
- * Hybrid expansion for ACORN-gamma compressed neighborhoods
- */
-static void
-HnswExpandUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int targetLm, int lc)
-{
-	int			firstHop = *unvisitedLength;
-
-	for (int i = 0; i < firstHop && *unvisitedLength < targetLm; i++)
-	{
-		ItemPointer indextid = &unvisited[i].indextid;
-		HnswElement neighbor;
-
-		neighbor = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
-		HnswLoadElement(neighbor, NULL, NULL, index, support, false, NULL);
-
-		if (neighbor->level >= lc)
-			HnswAppendUnvisitedFromDisk(neighbor, unvisited, unvisitedLength, v, index, m, lm, lc, targetLm);
-
-		pfree(neighbor);
-	}
-}
-
-/*
  * Algorithm 2 from paper
  */
 List *
@@ -1077,22 +981,22 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	pairingheap *M = NULL;
 	int			wlen = 0;
+	int			mlen = 0;
+	int			prefilterHops = 0;
 	visited_hash vh;
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
-	int			storedLm = HnswGetLayerM(m, lc);
-	int			targetM = q != NULL && q->graphM > 0 ? q->graphM : m;
-	int			targetLm = HnswGetLayerM(targetM, lc);
-	int			baseM = q != NULL && q->baseM > 0 ? q->baseM : m;
-	int			baseLm = HnswGetLayerM(baseM, lc);
+	int			lm = HnswGetLayerM(m, lc);
 	bool		inMemory = index == NULL;
-	bool		acornFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
-	int			scanLm = acornFilter ? storedLm : Min(baseLm, storedLm);
-	int			maxUnvisited = acornFilter ? Max(storedLm, targetLm) : scanLm;
-	HnswUnvisited *unvisited = palloc(maxUnvisited * sizeof(HnswUnvisited));
+	bool		prefilter = !inMemory && lc == 0 && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
+	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
+
+	if (prefilter)
+		M = pairingheap_allocate(CompareFurthestMatchedCandidates, NULL);
 
 	if (v == NULL)
 	{
@@ -1111,7 +1015,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	/* Create local memory for neighborhood if needed */
 	if (inMemory)
 	{
-		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(storedLm);
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
 		localNeighborhood = palloc(neighborhoodSize);
 	}
 
@@ -1139,31 +1043,58 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		 * affect insert performance.
 		 */
 		if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+		{
 			wlen++;
+
+			if (prefilter && HnswElementMatchesScan(HnswPtrAccess(base, sc->element), index, q->scan))
+			{
+				pairingheap_add(M, &sc->m_node);
+				if (mlen < ef)
+					mlen++;
+				else
+					pairingheap_remove_first(M);
+			}
+		}
 	}
 
 	while (!pairingheap_is_empty(C))
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
-		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswSearchCandidate *f;
+		HnswSearchCandidate *fw;
 		HnswElement cElement;
-		int			filteredLength = 0;
-		int			maxFilteredLength = acornFilter ? baseM : scanLm;
 
-		if (c->distance > f->distance)
-			break;
+		if (prefilter)
+		{
+			fw = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+
+			if (mlen >= ef)
+			{
+				f = HnswGetSearchCandidate(m_node, pairingheap_first(M));
+				if (c->distance > f->distance)
+					break;
+			}
+			else if (wlen >= ef && c->distance > fw->distance)
+			{
+				if (prefilterHops >= ef)
+					break;
+
+				prefilterHops++;
+			}
+		}
+		else
+		{
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			if (c->distance > f->distance)
+				break;
+		}
 
 		cElement = HnswPtrAccess(base, c->element);
 
 		if (inMemory)
-			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize, scanLm);
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize, lm);
 		else
-		{
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, scanLm, lc, maxUnvisited);
-
-			if (acornFilter && targetLm > scanLm && unvisitedLength < targetLm)
-				HnswExpandUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, support, m, scanLm, targetLm, lc);
-		}
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, lm);
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -1174,8 +1105,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswElement eElement;
 			HnswSearchCandidate *e;
 			double		eDistance;
-			bool		alwaysAdd = wlen < ef;
+			bool		alwaysAdd = wlen < ef || (prefilter && wlen >= ef && mlen < ef && prefilterHops < ef);
 			double	   *maxDistance;
+			bool		matches = true;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
@@ -1192,8 +1124,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				maxDistance = (alwaysAdd || discarded != NULL || acornFilter) ? NULL : &f->distance;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, acornFilter ? q->scan : NULL);
+				maxDistance = (alwaysAdd || discarded != NULL) ? NULL : &f->distance;
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, prefilter ? q->scan : NULL, prefilter ? &matches : NULL);
 
 				if (eElement == NULL)
 					continue;
@@ -1202,13 +1134,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			/* Make robust to issues */
 			if (eElement->level < lc)
 				continue;
-
-			if (acornFilter)
-			{
-				filteredLength++;
-				if (filteredLength > maxFilteredLength)
-					break;
-			}
 
 			if (!(eDistance < f->distance || alwaysAdd))
 			{
@@ -1244,16 +1169,37 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
 				}
+
+				if (prefilter && matches)
+				{
+					pairingheap_add(M, &e->m_node);
+					if (mlen < ef)
+						mlen++;
+					else
+						pairingheap_remove_first(M);
+				}
 			}
 		}
 	}
 
-	/* Add each element of W to w */
-	while (!pairingheap_is_empty(W))
+	/* Add each element to w */
+	if (prefilter)
 	{
-		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+		while (!pairingheap_is_empty(M))
+		{
+			HnswSearchCandidate *sc = HnswGetSearchCandidate(m_node, pairingheap_remove_first(M));
 
-		w = lappend(w, sc);
+			w = lappend(w, sc);
+		}
+	}
+	else
+	{
+		while (!pairingheap_is_empty(W))
+		{
+			HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+			w = lappend(w, sc);
+		}
 	}
 
 	return w;
@@ -1563,8 +1509,6 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 	q.value = HnswGetValue(base, element);
 	q.scan = NULL;
-	q.baseM = m;
-	q.graphM = m;
 
 	/* Precompute hash */
 	if (inMemory)
