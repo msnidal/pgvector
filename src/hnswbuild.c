@@ -546,6 +546,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Ok, we can proceed to allocate the element */
 	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
 	valuePtr = HnswAlloc(allocator, valueSize);
+	HnswSetElementPayloadFromValues(base, element, index, values, isnull, allocator);
 
 	/*
 	 * We have now allocated the space needed for the element, so we don't
@@ -557,7 +558,6 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Copy the datum */
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
 	HnswPtrStore(base, element->value, valuePtr);
-	HnswSetElementPayloadFromValues(base, element, index, values, isnull, allocator);
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);

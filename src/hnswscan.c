@@ -123,6 +123,17 @@ ShowMemoryUsage(HnswScanOpaque so)
 #endif
 
 /*
+ * Clear scan filter pointers after context resets
+ */
+static void
+ResetScanFilterState(HnswScanOpaque so)
+{
+	so->hasFilter = false;
+	so->q.filter = NULL;
+	MemSet(&so->filterState, 0, sizeof(HnswFilterStateData));
+}
+
+/*
  * Prepare for an index scan
  */
 IndexScanDesc
@@ -148,12 +159,15 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 									   "Hnsw scan temporary context",
 									   0, 8 * 1024, 256 * 1024);
 
+	so->filterCtx = AllocSetContextCreate(CurrentMemoryContext,
+									   "Hnsw scan filter context",
+									   0, 8 * 1024, 256 * 1024);
+
 	/* Calculate max memory */
 	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
-	so->hasFilter = false;
-	so->q.filter = NULL;
+	ResetScanFilterState(so);
 
 	scan->opaque = so;
 
@@ -175,6 +189,8 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
+	MemoryContextReset(so->filterCtx);
+	ResetScanFilterState(so);
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -182,7 +198,7 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	if (orderbys && scan->numberOfOrderBys > 0)
 		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
 
-	so->hasFilter = HnswInitFilterState(scan->indexRelation, so->tmpCtx, &so->filterState);
+	so->hasFilter = HnswInitFilterState(scan->indexRelation, so->filterCtx, &so->filterState);
 	so->q.filter = so->hasFilter ? &so->filterState : NULL;
 }
 
@@ -354,6 +370,8 @@ hnswendscan(IndexScanDesc scan)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
+	ResetScanFilterState(so);
+	MemoryContextDelete(so->filterCtx);
 	MemoryContextDelete(so->tmpCtx);
 
 	pfree(so);

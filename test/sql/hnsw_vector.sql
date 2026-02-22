@@ -146,6 +146,22 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
+-- INCLUDE filters with fixed-length pass-by-reference type
+
+CREATE TABLE t (val vector(3), ns uuid);
+INSERT INTO t (val, ns) VALUES
+	('[0,0,0]', '00000000-0000-0000-0000-000000000001'),
+	('[1,2,3]', '00000000-0000-0000-0000-000000000002'),
+	('[1,2,4]', '00000000-0000-0000-0000-000000000003');
+CREATE INDEX t_hnsw_uuid_idx ON t USING hnsw (val vector_l2_ops) INCLUDE (ns);
+
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_uuid_idx', 'ns', '=', '00000000-0000-0000-0000-000000000002');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+COMMIT;
+
+DROP TABLE t;
+
 -- options
 
 CREATE TABLE t (val vector(3));

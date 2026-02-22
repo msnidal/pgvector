@@ -14,6 +14,7 @@
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/lsyscache.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
@@ -832,6 +833,8 @@ HnswTuplePassesFilter(Relation index, HnswElementTuple etup, Size tupleSize, Hns
 	{
 		HnswFilterClauseData *clause = &filter->clauses[i];
 		Datum		candidate;
+		Datum		cmpCandidate;
+		char	   *alignedCandidate = NULL;
 		bool		isnull;
 		int32		cmp;
 
@@ -841,7 +844,23 @@ HnswTuplePassesFilter(Relation index, HnswElementTuple etup, Size tupleSize, Hns
 		if (isnull)
 			return false;
 
-		cmp = DatumGetInt32(FunctionCall2Coll(&clause->cmpFunc, clause->collation, candidate, clause->value));
+		cmpCandidate = candidate;
+
+		/*
+		 * INCLUDE payload bytes may not be naturally aligned. Copy fixed-length,
+		 * pass-by-reference types to aligned memory before comparison.
+		 */
+		if (!clause->typbyval && clause->typlen > 0)
+		{
+			alignedCandidate = palloc(clause->typlen);
+			memcpy(alignedCandidate, DatumGetPointer(candidate), clause->typlen);
+			cmpCandidate = PointerGetDatum(alignedCandidate);
+		}
+
+		cmp = DatumGetInt32(FunctionCall2Coll(&clause->cmpFunc, clause->collation, cmpCandidate, clause->value));
+
+		if (alignedCandidate != NULL)
+			pfree(alignedCandidate);
 
 		switch (clause->op)
 		{
@@ -997,6 +1016,7 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
 {
 	bool		inMemory = index == NULL;
 	double		distance;
+	bool		entryPasses = true;
 
 	if (inMemory)
 		distance = GetElementDistance(base, entryPoint, q, support);
@@ -1006,6 +1026,12 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
 
 		entryQuery.filter = NULL;
 		HnswLoadElement(entryPoint, &distance, &entryQuery, index, support, loadVec, NULL);
+
+		if (q != NULL && q->filter != NULL && q->filter->numClauses > 0)
+			entryPasses = HnswElementPassesFilter(entryPoint, index, q->filter);
+
+		if (!entryPasses)
+			distance = get_float8_infinity();
 	}
 
 	return HnswInitSearchCandidate(base, entryPoint, distance);
@@ -1356,6 +1382,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswSearchCandidate *e;
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
+			double	   *maxDistance;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
@@ -1372,10 +1399,22 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				maxDistance = (alwaysAdd || discarded != NULL || acornFilter) ? NULL : &f->distance;
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement);
 
 				if (eElement == NULL)
 					continue;
+			}
+
+			/* Make robust to issues */
+			if (eElement->level < lc)
+				continue;
+
+			if (acornFilter)
+			{
+				filteredLength++;
+				if (filteredLength > maxFilteredLength)
+					break;
 			}
 
 			if (!(eDistance < f->distance || alwaysAdd))
@@ -1389,17 +1428,6 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				continue;
 			}
-
-			if (acornFilter)
-			{
-				filteredLength++;
-				if (filteredLength > maxFilteredLength)
-					break;
-			}
-
-			/* Make robust to issues */
-			if (eElement->level < lc)
-				continue;
 
 			/* Create a new candidate */
 			e = HnswInitSearchCandidate(base, eElement, eDistance);

@@ -420,6 +420,7 @@ typedef struct HnswScanOpaqueData
 	double		previousDistance;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
+	MemoryContext filterCtx;
 
 	/* Support functions */
 	HnswSupport support;
