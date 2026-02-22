@@ -108,6 +108,44 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
+-- INCLUDE filters (extension-side ACORN predicates)
+
+CREATE TABLE t (val vector(3), val2 int);
+INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2), ('[1,2,4]', 4);
+CREATE INDEX t_hnsw_idx ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '2');
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '<=', '3');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+COMMIT;
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '=', '4');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+SELECT hnsw_clear_filter('t_hnsw_idx');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+COMMIT;
+
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '3');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+SELECT hnsw_clear_filters();
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+COMMIT;
+
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '!=', '2');
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'missing', '=', '2');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ROLLBACK;
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+
+DROP TABLE t;
+
 -- options
 
 CREATE TABLE t (val vector(3));

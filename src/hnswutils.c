@@ -4,18 +4,23 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/xact.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -64,6 +69,116 @@ hash_tid(ItemPointerData tid)
 #define	SH_SCOPE		extern
 #define SH_DEFINE
 #include "lib/simplehash.h"
+
+typedef struct HnswRawFilterClause
+{
+	char	   *column;
+	HnswFilterOperator op;
+	char	   *value;
+} HnswRawFilterClause;
+
+typedef struct HnswRawFilterEntry
+{
+	Oid			indexOid;
+	List	   *clauses;
+} HnswRawFilterEntry;
+
+static List *hnswRawFilters = NIL;
+static bool hnswRawFiltersXactCbRegistered = false;
+
+static HnswRawFilterEntry *
+GetRawFilterEntry(Oid indexOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, hnswRawFilters)
+	{
+		HnswRawFilterEntry *entry = (HnswRawFilterEntry *) lfirst(lc);
+
+		if (entry->indexOid == indexOid)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static HnswFilterOperator
+ParseFilterOperator(const char *op)
+{
+	if (strcmp(op, "=") == 0)
+		return HNSW_FILTER_EQ;
+	if (strcmp(op, "<") == 0)
+		return HNSW_FILTER_LT;
+	if (strcmp(op, "<=") == 0)
+		return HNSW_FILTER_LE;
+	if (strcmp(op, ">") == 0)
+		return HNSW_FILTER_GT;
+	if (strcmp(op, ">=") == 0)
+		return HNSW_FILTER_GE;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unsupported HNSW filter operator: %s", op),
+			 errhint("Supported operators are: =, <, <=, >, >=.")));
+
+	return HNSW_FILTER_EQ;
+}
+
+static void
+FreeRawFilterEntry(HnswRawFilterEntry *entry)
+{
+	ListCell   *lc;
+
+	foreach(lc, entry->clauses)
+	{
+		HnswRawFilterClause *clause = (HnswRawFilterClause *) lfirst(lc);
+
+		pfree(clause->column);
+		pfree(clause->value);
+		pfree(clause);
+	}
+
+	list_free(entry->clauses);
+	pfree(entry);
+}
+
+static void
+ResetRawFilters(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, hnswRawFilters)
+		FreeRawFilterEntry((HnswRawFilterEntry *) lfirst(lc));
+
+	list_free(hnswRawFilters);
+	hnswRawFilters = NIL;
+}
+
+static void
+RemoveRawFilterEntry(Oid indexOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, hnswRawFilters)
+	{
+		HnswRawFilterEntry *entry = (HnswRawFilterEntry *) lfirst(lc);
+
+		if (entry->indexOid == indexOid)
+		{
+			hnswRawFilters = list_delete_ptr(hnswRawFilters, entry);
+			FreeRawFilterEntry(entry);
+			return;
+		}
+	}
+}
+
+static void
+HnswRawFiltersXactCallback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT ||
+		event == XACT_EVENT_PREPARE)
+		ResetRawFilters();
+}
 
 /* Pointer hash table */
 static uint32
@@ -243,9 +358,9 @@ HnswAlloc(HnswAllocator * allocator, Size size)
  * Allocate an element
  */
 HnswElement
-HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator, int numPredicates)
+HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator)
 {
-	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData) + (sizeof(DatumPtr) * numPredicates));
+	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
 
 	int			level = (int) (-log(RandomDouble()) * ml);
 
@@ -264,10 +379,8 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	HnswInitNeighbors(base, element, m, allocator);
 
 	HnswPtrStore(base, element->value, (Pointer) NULL);
-	for (int i = 0; i < numPredicates; i++)
-	{
-			HnswPtrStore(base, element->predicateValues[i], (Pointer)NULL);
-	}
+	HnswPtrStore(base, element->payloadData, (Pointer) NULL);
+	element->payloadSize = 0;
 
 	return element;
 }
@@ -285,20 +398,17 @@ HnswAddHeapTid(HnswElement element, ItemPointer heaptid)
  * Allocate an element from block and offset numbers
  */
 HnswElement
-HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno, int numPredicates)
+HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 {
-	HnswElement element = palloc(sizeof(HnswElementData) + (sizeof(DatumPtr) * numPredicates));
+	HnswElement element = palloc(sizeof(HnswElementData));
 	char	   *base = NULL;
 
 	element->blkno = blkno;
 	element->offno = offno;
 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
 	HnswPtrStore(base, element->value, (Pointer) NULL);
-
-	for (int i = 0; i < numPredicates; i++)
-	{
-		HnswPtrStore(base, element->predicateValues[i], (Pointer)NULL);
-	}
+	HnswPtrStore(base, element->payloadData, (Pointer) NULL);
+	element->payloadSize = 0;
 	return element;
 }
 
@@ -311,13 +421,11 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	Buffer		buf;
 	Page		page;
 	HnswMetaPage metap;
-	int     numPredicates;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
-	numPredicates = HnswGetNumPredicates(index);
 
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
@@ -329,7 +437,7 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
 		{
-			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno, numPredicates);
+			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
 			(*entryPoint)->level = metap->entryLevel;
 		}
 		else
@@ -440,61 +548,141 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 }
 
 /*
- * Set element tuple, except for neighbor info
- * If predicates are provided via INCLUDE clause, they are also colocated with the element tuple data
+ * Serialize INCLUDE column values into a payload attached to each element
  */
-void HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, int numPredicates, Oid *predicateOids) {
-	    char *dest = (char *) etup;
-	    Pointer valuePtr = HnswPtrAccess(base, element->value);
-	    etup->type = HNSW_ELEMENT_TUPLE_TYPE;
-	    etup->level = element->level;
-	    etup->deleted = element->deleted;
-	    etup->version = element->version;
-	
-	    dest += offsetof(HnswElementTupleData, heaptids);
-	    memcpy(dest, element->heaptids, sizeof(ItemPointerData) * HNSW_HEAPTIDS);
-	
-	    dest += sizeof(ItemPointerData) * HNSW_HEAPTIDS;
-	    dest = (char *) MAXALIGN(dest); // Align after fixed-size data
-	
-	    etup->data.vl_len_ = VARSIZE_ANY(valuePtr);
-	    memcpy((void *) &etup->data, valuePtr, VARSIZE_ANY(valuePtr));
-	
-	    dest += VARSIZE_ANY(valuePtr);
-	    dest = (char *) MAXALIGN(dest); // Align after vector data
-	
-	    /* Copy each predicate, placing them contiguously after vector data */
-	    for (int i = 0; i < numPredicates; i++) {
-	        Datum predDatum;
-	        Pointer predPtr = HnswPtrAccess(base, element->predicateValues[i]);
-	        bool typByVal;
-	        int16 typLen;
-	
-	        get_typlenbyval(predicateOids[i], &typLen, &typByVal);
-	
-	        if (predPtr == NULL) {
-	            elog(ERROR, "Predicate pointer is NULL, possible memory corruption"); // Critical error
-	        }
-	
-	        if (typByVal) {
-	            predDatum = *((Datum *) predPtr);
-	            memcpy(dest, &predDatum, sizeof(Datum));
-	            dest += sizeof(Datum);
-	        } else {
-	            Size dataSize = datumGetSize(predDatum, typByVal, typLen);
-	            if (dataSize > 0) {
-	                memcpy(dest, predPtr, dataSize);
-	                ((HnswElementTuple) etup)->predicateData[i] = PointerGetDatum(dest); // Store pointer in tuple
-	                dest += MAXALIGN(dataSize); // Align after each varlena
-	            } else {
-	                ((HnswElementTuple) etup)->predicateData[i] = PointerGetDatum(NULL); // Handle empty varlena? Or error?
-	            }
-	        }
-	    }
-	    // No need to set predicateData pointers within etup->predicateData,
-	    // as we are copying the raw bytes and will reconstruct pointers on load.
-	
-	 }
+void
+HnswSetElementPayloadFromValues(char *base, HnswElement element, Relation index, Datum *values, bool *isnull, HnswAllocator *allocator)
+{
+	int			numIncludes = HnswGetNumPredicates(index);
+	int			nkey = index->rd_index->indnkeyatts;
+	TupleDesc	tupleDesc = RelationGetDescr(index);
+	Size		payloadSize = 0;
+	Pointer		payload;
+	char	   *payloadCursor;
+	Datum	   *detoasted;
+	bool	   *freeDetoasted;
+
+	if (numIncludes <= 0)
+	{
+		element->payloadSize = 0;
+		HnswPtrStore(base, element->payloadData, (Pointer) NULL);
+		return;
+	}
+
+	detoasted = palloc0(sizeof(Datum) * numIncludes);
+	freeDetoasted = palloc0(sizeof(bool) * numIncludes);
+
+	for (int i = 0; i < numIncludes; i++)
+	{
+		int16		typlen;
+		bool		typbyval;
+		uint32		len;
+		Datum		d;
+
+		payloadSize += sizeof(uint32);
+
+		if (isnull[nkey + i])
+			continue;
+
+		get_typlenbyval(TupleDescAttr(tupleDesc, nkey + i)->atttypid, &typlen, &typbyval);
+		d = values[nkey + i];
+
+		if (typbyval)
+			len = sizeof(Datum);
+		else if (typlen < 0)
+		{
+			Pointer		packed = (Pointer) PG_DETOAST_DATUM_PACKED(DatumGetPointer(d));
+
+			detoasted[i] = PointerGetDatum(packed);
+			freeDetoasted[i] = packed != DatumGetPointer(d);
+			len = VARSIZE_ANY(packed);
+		}
+		else
+			len = typlen;
+
+		payloadSize += len;
+	}
+
+	payload = HnswAlloc(allocator, payloadSize);
+	payloadCursor = payload;
+
+	for (int i = 0; i < numIncludes; i++)
+	{
+		int16		typlen;
+		bool		typbyval;
+		uint32		len;
+		Datum		d;
+
+		if (isnull[nkey + i])
+		{
+			len = UINT32_MAX;
+			memcpy(payloadCursor, &len, sizeof(uint32));
+			payloadCursor += sizeof(uint32);
+			continue;
+		}
+
+		get_typlenbyval(TupleDescAttr(tupleDesc, nkey + i)->atttypid, &typlen, &typbyval);
+		d = freeDetoasted[i] ? detoasted[i] : values[nkey + i];
+
+		if (typbyval)
+			len = sizeof(Datum);
+		else if (typlen < 0)
+			len = VARSIZE_ANY(DatumGetPointer(d));
+		else
+			len = typlen;
+
+		memcpy(payloadCursor, &len, sizeof(uint32));
+		payloadCursor += sizeof(uint32);
+
+		if (typbyval)
+			memcpy(payloadCursor, &d, sizeof(Datum));
+		else
+			memcpy(payloadCursor, DatumGetPointer(d), len);
+
+		payloadCursor += len;
+	}
+
+	for (int i = 0; i < numIncludes; i++)
+	{
+		if (freeDetoasted[i])
+			pfree(DatumGetPointer(detoasted[i]));
+	}
+
+	pfree(detoasted);
+	pfree(freeDetoasted);
+
+	element->payloadSize = payloadSize;
+	HnswPtrStore(base, element->payloadData, payload);
+}
+
+/*
+ * Set element tuple, except for neighbor info
+ */
+void
+HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
+{
+	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Pointer		payloadPtr = HnswPtrAccess(base, element->payloadData);
+	char	   *payloadDest = ((char *) &etup->data) + VARSIZE_ANY(valuePtr);
+
+	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
+	etup->level = element->level;
+	etup->deleted = element->deleted;
+	etup->version = element->version;
+
+	for (int i = 0; i < HNSW_HEAPTIDS; i++)
+	{
+		if (i < element->heaptidsLength)
+			etup->heaptids[i] = element->heaptids[i];
+		else
+			ItemPointerSetInvalid(&etup->heaptids[i]);
+	}
+
+	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+	if (element->payloadSize > 0)
+		memcpy(payloadDest, payloadPtr, element->payloadSize);
+}
 
 /*
  * Set neighbor tuple
@@ -535,7 +723,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
  * Load an element from a tuple
  */
 void
-HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, int numPredicates)
+HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec)
 {
 	element->level = etup->level;
 	element->deleted = etup->deleted;
@@ -564,13 +752,123 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 		HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
 	}
 
-	for (int i = 0; i < numPredicates; i++)
+	element->payloadSize = 0;
 	{
-		char	   *base = NULL;
-		//Datum		value = datumCopy(PointerGetDatum(&etup->predicateData[i]), false, -1);
+		char   *base = NULL;
 
-		//HnswPtrStore(base, element->predicateValues[i], DatumGetPointer(value));
+		HnswPtrStore(base, element->payloadData, (Pointer) NULL);
 	}
+}
+
+static bool
+GetIncludeDatum(HnswFilterState filter, char *payloadStart, char *payloadEnd, int includeIndex, Datum *value, bool *isnull)
+{
+	char	   *ptr = payloadStart;
+
+	for (int i = 0; i < filter->numIncludes; i++)
+	{
+		uint32		len;
+
+		if (ptr + sizeof(uint32) > payloadEnd)
+			return false;
+
+		memcpy(&len, ptr, sizeof(uint32));
+		ptr += sizeof(uint32);
+
+		if (i == includeIndex)
+		{
+			if (len == UINT32_MAX)
+			{
+				*isnull = true;
+				return true;
+			}
+
+			if (ptr + len > payloadEnd)
+				return false;
+
+			*isnull = false;
+
+			if (filter->includeTypbyval[i])
+			{
+				if (len != sizeof(Datum))
+					return false;
+
+				memcpy(value, ptr, sizeof(Datum));
+			}
+			else
+				*value = PointerGetDatum(ptr);
+
+			return true;
+		}
+
+		if (len != UINT32_MAX)
+		{
+			if (ptr + len > payloadEnd)
+				return false;
+
+			ptr += len;
+		}
+	}
+
+	return false;
+}
+
+static bool
+HnswTuplePassesFilter(Relation index, HnswElementTuple etup, Size tupleSize, HnswFilterState filter)
+{
+	char	   *payloadStart;
+	char	   *payloadEnd;
+
+	if (filter == NULL || filter->numClauses == 0)
+		return true;
+
+	if (HnswGetNumPredicates(index) <= 0)
+		return false;
+
+	payloadStart = ((char *) &etup->data) + VARSIZE_ANY(&etup->data);
+	payloadEnd = ((char *) etup) + tupleSize;
+
+	for (int i = 0; i < filter->numClauses; i++)
+	{
+		HnswFilterClauseData *clause = &filter->clauses[i];
+		Datum		candidate;
+		bool		isnull;
+		int32		cmp;
+
+		if (!GetIncludeDatum(filter, payloadStart, payloadEnd, clause->includeIndex, &candidate, &isnull))
+			elog(ERROR, "corrupt HNSW INCLUDE payload");
+
+		if (isnull)
+			return false;
+
+		cmp = DatumGetInt32(FunctionCall2Coll(&clause->cmpFunc, clause->collation, candidate, clause->value));
+
+		switch (clause->op)
+		{
+			case HNSW_FILTER_EQ:
+				if (cmp != 0)
+					return false;
+				break;
+			case HNSW_FILTER_LT:
+				if (!(cmp < 0))
+					return false;
+				break;
+			case HNSW_FILTER_LE:
+				if (!(cmp <= 0))
+					return false;
+				break;
+			case HNSW_FILTER_GT:
+				if (!(cmp > 0))
+					return false;
+				break;
+			case HNSW_FILTER_GE:
+				if (!(cmp >= 0))
+					return false;
+				break;
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -590,18 +888,25 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 {
 	Buffer		buf;
 	Page		page;
+	ItemId		itemid;
 	HnswElementTuple etup;
-	int     numPredicates;
+	Size		tupleSize;
 
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	numPredicates = HnswGetNumPredicates(index);
-
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	itemid = PageGetItemId(page, offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
+	tupleSize = ItemIdGetLength(itemid);
 
 	Assert(HnswIsElementTuple(etup));
+
+	if (q != NULL && q->filter != NULL && q->filter->numClauses > 0 && !HnswTuplePassesFilter(index, etup, tupleSize, q->filter))
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
 
 	/* Calculate distance */
 	if (distance != NULL)
@@ -616,9 +921,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
 	{
 		if (*element == NULL)
-			*element = HnswInitElementFromBlock(blkno, offno, numPredicates);
+			*element = HnswInitElementFromBlock(blkno, offno);
 
-		HnswLoadElementFromTuple(*element, etup, true, loadVec, numPredicates);
+		HnswLoadElementFromTuple(*element, etup, true, loadVec);
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -631,6 +936,33 @@ void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
 	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+}
+
+bool
+HnswElementPassesFilter(HnswElement element, Relation index, HnswFilterState filter)
+{
+	Buffer		buf;
+	Page		page;
+	ItemId		itemid;
+	HnswElementTuple etup;
+	Size		tupleSize;
+	bool		passes;
+
+	if (filter == NULL || filter->numClauses == 0)
+		return true;
+
+	buf = ReadBuffer(index, element->blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	itemid = PageGetItemId(page, element->offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
+	tupleSize = ItemIdGetLength(itemid);
+
+	passes = HnswTuplePassesFilter(index, etup, tupleSize, filter);
+
+	UnlockReleaseBuffer(buf);
+
+	return passes;
 }
 
 /*
@@ -669,7 +1001,12 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
 	if (inMemory)
 		distance = GetElementDistance(base, entryPoint, q, support);
 	else
-		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+	{
+		HnswQuery	entryQuery = *q;
+
+		entryQuery.filter = NULL;
+		HnswLoadElement(entryPoint, &distance, &entryQuery, index, support, loadVec, NULL);
+	}
 
 	return HnswInitSearchCandidate(base, entryPoint, distance);
 }
@@ -846,7 +1183,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
  * Load unvisited neighbors from disk
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, bool expand, int maxUnvisited)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
 
@@ -865,8 +1202,60 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 		tidhash_insert(v->tids, *indextid, &found);
 
-		if (!found)
+		if (!found && *unvisitedLength < maxUnvisited)
 			unvisited[(*unvisitedLength)++].indextid = *indextid;
+
+		if (!expand)
+			continue;
+
+		if (*unvisitedLength >= maxUnvisited)
+			break;
+
+		{
+			Buffer		ebuf;
+			Page		epage;
+			HnswElementTuple etup;
+			HnswElement secondHop = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
+			ItemPointerData secondTids[HNSW_MAX_M * 2];
+
+			ebuf = ReadBuffer(index, ItemPointerGetBlockNumber(indextid));
+			LockBuffer(ebuf, BUFFER_LOCK_SHARE);
+			epage = BufferGetPage(ebuf);
+			etup = (HnswElementTuple) PageGetItem(epage, PageGetItemId(epage, ItemPointerGetOffsetNumber(indextid)));
+
+			if (!HnswIsElementTuple(etup))
+			{
+				UnlockReleaseBuffer(ebuf);
+				pfree(secondHop);
+				continue;
+			}
+
+			HnswLoadElementFromTuple(secondHop, etup, false, false);
+
+			UnlockReleaseBuffer(ebuf);
+
+			if (HnswLoadNeighborTids(secondHop, secondTids, index, m, lm, lc))
+			{
+				for (int j = 0; j < lm; j++)
+				{
+					ItemPointer secondTid = &secondTids[j];
+					bool		secondFound;
+
+					if (!ItemPointerIsValid(secondTid))
+						break;
+
+					tidhash_insert(v->tids, *secondTid, &secondFound);
+
+					if (!secondFound && *unvisitedLength < maxUnvisited)
+						unvisited[(*unvisitedLength)++].indextid = *secondTid;
+
+					if (*unvisitedLength >= maxUnvisited)
+						break;
+				}
+			}
+
+			pfree(secondHop);
+		}
 	}
 }
 
@@ -885,9 +1274,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
-	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+	bool		acornFilter = !inMemory && q != NULL && q->filter != NULL && q->filter->numClauses > 0 && lc == 0;
+	int			maxUnvisited = inMemory ? lm : (acornFilter ? lm + (lm * lm) : lm);
+	HnswUnvisited *unvisited = palloc(maxUnvisited * sizeof(HnswUnvisited));
+	int			unvisitedLength;
 
 	if (v == NULL)
 	{
@@ -942,6 +1333,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
+		int			filteredLength = 0;
+		int			maxFilteredLength = acornFilter ? m : lm;
 
 		if (c->distance > f->distance)
 			break;
@@ -951,7 +1344,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (inMemory)
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, acornFilter, maxUnvisited);
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -995,6 +1388,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				}
 
 				continue;
+			}
+
+			if (acornFilter)
+			{
+				filteredLength++;
+				if (filteredLength > maxFilteredLength)
+					break;
 			}
 
 			/* Make robust to issues */
@@ -1341,6 +1741,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	bool		inMemory = index == NULL;
 
 	q.value = HnswGetValue(base, element);
+	q.filter = NULL;
 
 	/* Precompute hash */
 	if (inMemory)
@@ -1443,6 +1844,155 @@ HnswGetTypeInfo(Relation index)
 	}
 	else
 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+}
+
+bool
+HnswInitFilterState(Relation index, MemoryContext tmpCtx, HnswFilterState filter)
+{
+	MemoryContext oldCtx;
+	HnswRawFilterEntry *entry;
+	TupleDesc	tupleDesc;
+	int			nkey;
+	ListCell   *lc;
+	int			clauseIdx = 0;
+
+	MemSet(filter, 0, sizeof(HnswFilterStateData));
+
+	entry = GetRawFilterEntry(RelationGetRelid(index));
+	if (entry == NULL || list_length(entry->clauses) == 0)
+		return false;
+
+	filter->numIncludes = HnswGetNumPredicates(index);
+	if (filter->numIncludes <= 0)
+		return false;
+
+	oldCtx = MemoryContextSwitchTo(tmpCtx);
+
+	tupleDesc = RelationGetDescr(index);
+	nkey = index->rd_index->indnkeyatts;
+
+	filter->includeTypeOids = palloc(sizeof(Oid) * filter->numIncludes);
+	filter->includeTyplen = palloc(sizeof(int16) * filter->numIncludes);
+	filter->includeTypbyval = palloc(sizeof(bool) * filter->numIncludes);
+
+	for (int i = 0; i < filter->numIncludes; i++)
+	{
+		Oid			typeOid = TupleDescAttr(tupleDesc, nkey + i)->atttypid;
+
+		filter->includeTypeOids[i] = typeOid;
+		get_typlenbyval(typeOid, &filter->includeTyplen[i], &filter->includeTypbyval[i]);
+	}
+
+	filter->numClauses = list_length(entry->clauses);
+	filter->clauses = palloc0(sizeof(HnswFilterClauseData) * filter->numClauses);
+
+	foreach(lc, entry->clauses)
+	{
+		HnswRawFilterClause *rawClause = (HnswRawFilterClause *) lfirst(lc);
+		HnswFilterClauseData *clause = &filter->clauses[clauseIdx++];
+		Oid			typInput;
+		Oid			typIoParam;
+		TypeCacheEntry *typentry;
+		int			includeIndex = -1;
+
+		for (int i = 0; i < filter->numIncludes; i++)
+		{
+			if (strcmp(NameStr(TupleDescAttr(tupleDesc, nkey + i)->attname), rawClause->column) == 0)
+			{
+				includeIndex = i;
+				break;
+			}
+		}
+
+		if (includeIndex < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("HNSW filter column \"%s\" is not an INCLUDE column", rawClause->column)));
+
+		clause->includeIndex = includeIndex;
+		clause->op = rawClause->op;
+		clause->typeOid = filter->includeTypeOids[includeIndex];
+		clause->typlen = filter->includeTyplen[includeIndex];
+		clause->typbyval = filter->includeTypbyval[includeIndex];
+		clause->collation = TupleDescAttr(tupleDesc, nkey + includeIndex)->attcollation;
+
+		getTypeInputInfo(clause->typeOid, &typInput, &typIoParam);
+		clause->value = OidInputFunctionCall(typInput, rawClause->value, typIoParam, -1);
+		if (!clause->typbyval)
+			clause->value = datumCopy(clause->value, false, clause->typlen);
+
+		typentry = lookup_type_cache(clause->typeOid, TYPECACHE_CMP_PROC_FINFO);
+		if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("type \"%s\" does not support ordered comparisons for HNSW filtering",
+							format_type_be(clause->typeOid))));
+
+		fmgr_info_cxt(typentry->cmp_proc_finfo.fn_oid, &clause->cmpFunc, tmpCtx);
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+
+	return true;
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_set_filter);
+Datum
+hnsw_set_filter(PG_FUNCTION_ARGS)
+{
+	Oid			indexOid = PG_GETARG_OID(0);
+	char	   *column = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *op = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *value = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	HnswRawFilterEntry *entry;
+	HnswRawFilterClause *clause;
+	MemoryContext oldCtx;
+
+	if (!hnswRawFiltersXactCbRegistered)
+	{
+		RegisterXactCallback(HnswRawFiltersXactCallback, NULL);
+		hnswRawFiltersXactCbRegistered = true;
+	}
+
+	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+
+	entry = GetRawFilterEntry(indexOid);
+	if (entry == NULL)
+	{
+		entry = palloc0(sizeof(HnswRawFilterEntry));
+		entry->indexOid = indexOid;
+		hnswRawFilters = lappend(hnswRawFilters, entry);
+	}
+
+	clause = palloc0(sizeof(HnswRawFilterClause));
+	clause->column = pstrdup(column);
+	clause->op = ParseFilterOperator(op);
+	clause->value = pstrdup(value);
+	entry->clauses = lappend(entry->clauses, clause);
+
+	MemoryContextSwitchTo(oldCtx);
+
+	PG_RETURN_VOID();
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_clear_filter);
+Datum
+hnsw_clear_filter(PG_FUNCTION_ARGS)
+{
+	Oid			indexOid = PG_GETARG_OID(0);
+
+	RemoveRawFilterEntry(indexOid);
+
+	PG_RETURN_VOID();
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_clear_filters);
+Datum
+hnsw_clear_filters(PG_FUNCTION_ARGS)
+{
+	ResetRawFilters();
+
+	PG_RETURN_VOID();
 }
 
 

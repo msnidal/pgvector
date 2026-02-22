@@ -160,7 +160,6 @@ CreateGraphPages(HnswBuildState * buildstate)
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
-	int  		 numPredicates = buildstate->numPredicates;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -188,27 +187,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Zero memory for each element */
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-		Size predicateSize = 0;
-		for (int i = 0; i < buildstate->numPredicates; i++)
-		{
-				char *predVal = HnswPtrAccess(base, element->predicateValues[i]);
-				int16 typLen;
-				bool typByVal;
-				get_typlenbyval(buildstate->predicateOids[i], &typLen, &typByVal);
-				
-				if (typByVal)
-						predicateSize += sizeof(Datum);
-				else if (typLen < 0)
-						predicateSize += VARSIZE_ANY(predVal);
-				else
-						predicateSize += typLen;
-		}
-
-		//if (predicateSize > 0)
-				//elog(ERROR, "predicate size total is \"%d\"", predicateSize);
-		//elog(ERROR, "value ptr size is \"%d\"", VARSIZE_ANY(valuePtr));
-
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr), predicateSize);
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr), element->payloadSize);
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -218,8 +197,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
-		// Get num predicates from build state
-		HnswSetElementTuple(base, etup, element, buildstate->numPredicates, buildstate->predicateOids);
+		HnswSetElementTuple(base, etup, element);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -437,7 +415,7 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, HnswEleme
 	char	   *base = buildstate->hnswarea;
 
 	/* Look for duplicate */
-	if (FindDuplicateInMemory(base, element))
+	if (buildstate->numIncludes == 0 && FindDuplicateInMemory(base, element))
 		return;
 
 	/* Add element */
@@ -511,7 +489,6 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	HnswSupport *support = &buildstate->support;
 	Size		valueSize;
 	Pointer		valuePtr;
-	Pointer 	 predicatePtr;
 	LWLock	   *flushLock = &graph->flushLock;
 	char	   *base = buildstate->hnswarea;
 	Datum		value;
@@ -531,7 +508,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
 	/*
@@ -563,11 +540,11 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
 	/* Ok, we can proceed to allocate the element */
-	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator, buildstate->numPredicates);
+	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
 	valuePtr = HnswAlloc(allocator, valueSize);
 
 	/*
@@ -579,54 +556,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 	/* Copy the datum */
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
-	HnswPtrStore(base, element->value, (char *) valuePtr);
-
-	// Copy INCLUDE columns (predicate values) 
-	TupleDesc tupleDesc = RelationGetDescr(index);
-	Oid		outputFunctionOid;
-	bool	isVarlena;
-
-	for (int i = 0; i < buildstate->numPredicates; i++)
-	{
-			int16 typlen;
-			bool typbyval;
-			char typalign;
-
-			get_typlenbyvalalign(buildstate->predicateOids[i], &typlen, &typbyval, &typalign);
-			getTypeOutputInfo(buildstate->predicateOids[i], &outputFunctionOid, &isVarlena);
-			Datum predValue = datumCopy(values[i + 1], typbyval, typlen);
-
-			Size predValueSize;
-			if (typbyval) { // pass-by-value
-					predValueSize = sizeof(Datum);
-					predicatePtr = HnswAlloc(allocator, predValueSize);
-					memcpy(predicatePtr, &predValue, predValueSize);
-			} else if (typlen == -1) { // variable length
-					predValueSize = VARSIZE_ANY(DatumGetPointer(predValue));
-					predicatePtr = HnswAlloc(allocator, predValueSize);
-					memcpy(predicatePtr, DatumGetPointer(predValue), predValueSize);
-			} else if (typlen > 0) { // fixed length
-					predValueSize = typlen;
-					predicatePtr = HnswAlloc(allocator, predValueSize);
-					memcpy(predicatePtr, DatumGetPointer(predValue), predValueSize);
-			} else {
-					elog(ERROR, "Unsupported type length");
-			}
-
-			elog(LOG, "Predicate Value Size: %zu", predValueSize);
-
-			// Store the INCLUDE/predicate values
-			HnswPtrStore(base, element->predicateValues[i], predicatePtr);
-
-			// For debugging, output the value appropriately
-			if (!OidIsValid(outputFunctionOid)) {
-					elog(ERROR, "No output function for type %u", buildstate->predicateOids[i]);
-			} else {
-				char *valueStr = OidOutputFunctionCall(outputFunctionOid, predValue);
-				elog(LOG, "Predicate Value: %s", valueStr);
-				pfree(valueStr);
-			}
-	}
+	HnswPtrStore(base, element->value, valuePtr);
+	HnswSetElementPayloadFromValues(base, element, index, values, isnull, allocator);
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -636,26 +567,6 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 	/* Release flush lock */
 	LWLockRelease(flushLock);
-
-	// log check if predicate values were set
-	for (int i = 0; i < buildstate->numPredicates; i++)
-	{
-			Datum predDatum;
-			int16 typlen;
-			bool typbyval;
-			char typalign;
-	
-			get_typlenbyvalalign(buildstate->predicateOids[i], &typlen, &typbyval, &typalign);
-			if (typbyval)
-					predDatum = *((Datum *) HnswPtrAccess(base, element->predicateValues[i]));
-			else
-					predDatum = PointerGetDatum(HnswPtrAccess(base, element->predicateValues[i]));
-	
-			getTypeOutputInfo(buildstate->predicateOids[i], &outputFunctionOid, &isVarlena);
-			char *valueStr = OidOutputFunctionCall(outputFunctionOid, predDatum);
-			elog(LOG, "Predicate Value (int): %s", valueStr);
-			pfree(valueStr);
-	}
 
 	return true;
 }
@@ -815,31 +726,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
-
-	// NOTE: unfailed ivff tests
-	// INCLUDE column predicate filtering 
-	buildstate->numPredicates = indexInfo->ii_NumIndexAttrs - indexInfo->ii_NumIndexKeyAttrs;
-	if (buildstate->numPredicates > 0)
-	{
-		// Copy INCLUDE columns (predicate values)
-		TupleDesc tupleDesc = RelationGetDescr(index);
-
-		buildstate->predicateOids = (Oid *) palloc(buildstate->numPredicates * sizeof(Oid));
-		for (int i = 0; i < buildstate->numPredicates; i++)
-		{
-			Oid		outputFunctionOid;
-			bool	isVarlena;
-			Form_pg_attribute predicateAttr = TupleDescAttr(tupleDesc, i + buildstate->indexInfo->ii_NumIndexAttrs - buildstate->numPredicates);
-			Oid predicateAtttypid = predicateAttr->atttypid;
-			getTypeOutputInfo(predicateAtttypid, &outputFunctionOid, &isVarlena);
-
-			buildstate->predicateOids[i] = predicateAtttypid;
-		}
-	}
-	else
-	{
-			buildstate->predicateOids = NULL;
-	}
+	buildstate->numIncludes = indexInfo->ii_NumIndexAttrs - indexInfo->ii_NumIndexKeyAttrs;
 }
 
 /*

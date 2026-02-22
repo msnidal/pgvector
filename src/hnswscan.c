@@ -152,6 +152,8 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
+	so->hasFilter = false;
+	so->q.filter = NULL;
 
 	scan->opaque = so;
 
@@ -179,6 +181,9 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 
 	if (orderbys && scan->numberOfOrderBys > 0)
 		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
+
+	so->hasFilter = HnswInitFilterState(scan->indexRelation, so->tmpCtx, &so->filterState);
+	so->q.filter = so->hasFilter ? &so->filterState : NULL;
 }
 
 /*
@@ -290,6 +295,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		sc = llast(so->w);
 		element = HnswPtrAccess(base, sc->element);
+
+		if (so->hasFilter && !HnswElementPassesFilter(element, scan->indexRelation, &so->filterState))
+		{
+			so->w = list_delete_last(so->w);
+
+			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			{
+				pfree(element);
+				pfree(sc);
+			}
+
+			continue;
+		}
 
 		/* Move to next element if no valid heap TIDs */
 		if (element->heaptidsLength == 0)

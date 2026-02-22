@@ -163,57 +163,15 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	uint8		tupleVersion;
 	char	   *base = NULL;
 
-	/* Get number of predicate columns */
-	int numPredicates = HnswGetNumPredicates(index);
-
-	/* Get the tuple descriptor from the index relation */
-	TupleDesc tupleDesc = RelationGetDescr(index);
-	int nkey = index->rd_index->indnkeyatts;
-
-	// Calculate the total size of predicate data
-	Size predicateSize = 0;
-	for (int i = 0; i < numPredicates; i++)
-	{
-			int attnum = nkey + i;
-			Form_pg_attribute predAttr = TupleDescAttr(tupleDesc, attnum);
-			Oid predType = predAttr->atttypid;
-			int16 typlen;
-			bool typbyval;
-			get_typlenbyval(predType, &typlen, &typbyval);
-			char *predVal = HnswPtrAccess(base, e->predicateValues[i]);
-			
-			if (typbyval)
-					 predicateSize += sizeof(Datum);
-			else
-					 predicateSize += VARSIZE_ANY(predVal);
-	}
-	
-	// Calculate element tuple size using the actual predicate data size 
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)), predicateSize);
+	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)), e->payloadSize);
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
 	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + sizeof(ItemIdData);
 
-	/* Allocate and prepare the element tuple */
+	/* Prepare element tuple */
 	etup = palloc0(etupSize);
-
-	// In AddElementOnDisk, before calling HnswSetElementTuple:
-	Oid *predicateOids = NULL;
-	if (numPredicates > 0)
-	{
-			TupleDesc tupleDesc = RelationGetDescr(index);
-			predicateOids = palloc(numPredicates * sizeof(Oid));
-			int nkey = index->rd_index->indnkeyatts;  // key attributes count
-			for (int i = 0; i < numPredicates; i++)
-			{
-					/* Predicate columns follow the key columns */
-					predicateOids[i] = TupleDescAttr(tupleDesc, nkey + i)->atttypid;
-			}
-	}
-
-	// Update HnswSetElementTuple to accept predicateOids:
-	HnswSetElementTuple(base, etup, e, numPredicates, predicateOids);
+	HnswSetElementTuple(base, etup, e);
 
 	/* Prepare neighbor tuple */
 	ntup = palloc0(ntupSize);
@@ -396,7 +354,6 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
 	ItemPointerData indextids[HNSW_MAX_M * 2];
-	int numPredicates = HnswGetNumPredicates(index);
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
 		return neighbors;
@@ -410,7 +367,7 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 		if (!ItemPointerIsValid(indextid))
 			break;
 
-		e = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid), numPredicates);
+		e = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
 		hc = &neighbors->items[neighbors->length++];
 		HnswPtrStore(base, hc->element, e);
 	}
@@ -476,6 +433,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 		HnswQuery	q;
 
 		q.value = HnswGetValue(base, element);
+		q.filter = NULL;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
@@ -713,7 +671,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
 	/* Look for duplicate */
-	if (FindDuplicateOnDisk(index, element, building))
+	if (HnswGetNumPredicates(index) == 0 && FindDuplicateOnDisk(index, element, building))
 		return;
 
 	/* Add element */
@@ -735,7 +693,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
  * Insert a tuple into the index
  */
 bool
-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum *values, bool *isnull, ItemPointer heaptid, bool building)
 {
 	HnswElement entryPoint;
 	HnswElement element;
@@ -743,7 +701,6 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	int			efConstruction = HnswGetEfConstruction(index);
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
-	int     numPredicates = HnswGetNumPredicates(index);
 
 	/*
 	 * Get a shared lock. This allows vacuum to ensure no in-flight inserts
@@ -756,8 +713,9 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
 
 	/* Create an element */
-	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL, numPredicates);
+	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
 	HnswPtrStore(base, element->value, DatumGetPointer(value));
+	HnswSetElementPayloadFromValues(base, element, index, values, isnull, NULL);
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -801,7 +759,7 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;
 
-	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
+	HnswInsertTupleOnDisk(index, &support, value, values, isnull, heaptid, false);
 }
 
 /*

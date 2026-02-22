@@ -171,6 +171,122 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 (3 rows)
 
 DROP TABLE t;
+-- INCLUDE filters (extension-side ACORN predicates)
+CREATE TABLE t (val vector(3), val2 int);
+INSERT INTO t (val, val2) VALUES ('[0,0,0]', 1), ('[1,2,3]', 3), ('[1,1,1]', 2), ('[1,2,4]', 4);
+CREATE INDEX t_hnsw_idx ON t USING hnsw (val vector_l2_ops) INCLUDE (val2);
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '2');
+ hnsw_set_filter 
+-----------------
+ 
+(1 row)
+
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '<=', '3');
+ hnsw_set_filter 
+-----------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,1,1] |    2
+(2 rows)
+
+COMMIT;
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,2,4] |    4
+ [1,1,1] |    2
+ [0,0,0] |    1
+(4 rows)
+
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '=', '4');
+ hnsw_set_filter 
+-----------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,4] |    4
+(1 row)
+
+SELECT hnsw_clear_filter('t_hnsw_idx');
+ hnsw_clear_filter 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,2,4] |    4
+ [1,1,1] |    2
+ [0,0,0] |    1
+(4 rows)
+
+COMMIT;
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '>=', '3');
+ hnsw_set_filter 
+-----------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,2,4] |    4
+(2 rows)
+
+SELECT hnsw_clear_filters();
+ hnsw_clear_filters 
+--------------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,2,4] |    4
+ [1,1,1] |    2
+ [0,0,0] |    1
+(4 rows)
+
+COMMIT;
+SELECT hnsw_set_filter('t_hnsw_idx', 'val2', '!=', '2');
+ERROR:  unsupported HNSW filter operator: !=
+HINT:  Supported operators are: =, <, <=, >, >=.
+BEGIN;
+SELECT hnsw_set_filter('t_hnsw_idx', 'missing', '=', '2');
+ hnsw_set_filter 
+-----------------
+ 
+(1 row)
+
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ERROR:  HNSW filter column "missing" is not an INCLUDE column
+ROLLBACK;
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   | val2 
+---------+------
+ [1,2,3] |    3
+ [1,2,4] |    4
+ [1,1,1] |    2
+ [0,0,0] |    1
+(4 rows)
+
+DROP TABLE t;
 -- options
 CREATE TABLE t (val vector(3));
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 1);

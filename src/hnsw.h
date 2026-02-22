@@ -66,7 +66,7 @@ typedef Pointer Item;
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
-#define HNSW_ELEMENT_TUPLE_SIZE(size, predicatesSize)  MAXALIGN(offsetof(HnswElementTupleData, data) + (size) + (predicatesSize))
+#define HNSW_ELEMENT_TUPLE_SIZE(size, payloadSize) MAXALIGN(offsetof(HnswElementTupleData, data) + (size) + (payloadSize))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
@@ -156,8 +156,9 @@ struct HnswElementData
 	OffsetNumber neighborOffno;
 	BlockNumber neighborPage;
 	DatumPtr	value;
+	uint32		payloadSize;
+	DatumPtr	payloadData;
 	LWLock		lock;
-	DatumPtr  predicateValues[FLEXIBLE_ARRAY_MEMBER];
 };
 
 typedef HnswElementData * HnswElement;
@@ -258,6 +259,39 @@ typedef struct HnswTypeInfo
 	void		(*checkValue) (Pointer v);
 }			HnswTypeInfo;
 
+typedef enum HnswFilterOperator
+{
+	HNSW_FILTER_EQ,
+	HNSW_FILTER_LT,
+	HNSW_FILTER_LE,
+	HNSW_FILTER_GT,
+	HNSW_FILTER_GE
+} HnswFilterOperator;
+
+typedef struct HnswFilterClauseData
+{
+	int			includeIndex;
+	HnswFilterOperator op;
+	Oid			typeOid;
+	Oid			collation;
+	int16		typlen;
+	bool		typbyval;
+	Datum		value;
+	FmgrInfo	cmpFunc;
+} HnswFilterClauseData;
+
+typedef struct HnswFilterStateData
+{
+	int			numIncludes;
+	Oid		   *includeTypeOids;
+	int16	   *includeTyplen;
+	bool	   *includeTypbyval;
+	int			numClauses;
+	HnswFilterClauseData *clauses;
+} HnswFilterStateData;
+
+typedef HnswFilterStateData *HnswFilterState;
+
 typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
@@ -268,7 +302,7 @@ typedef struct HnswSupport
 typedef struct HnswQuery
 {
 	Datum		value;
-	Datum   *predicateValues;
+	HnswFilterState filter;
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -308,9 +342,8 @@ typedef struct HnswBuildState
 	HnswShared *hnswshared;
 	char	   *hnswarea;
 
-	/* Predicate filtering */
-	int 	 numPredicates;
-	Oid 	*predicateOids;
+	/* INCLUDE columns */
+	int			numIncludes;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -347,7 +380,6 @@ typedef struct HnswElementTupleData
 	ItemPointerData neighbortid;
 	uint16		unused;
 	Vector		data;
-	Datum 		predicateData[FLEXIBLE_ARRAY_MEMBER];
 }			HnswElementTupleData;
 
 typedef HnswElementTupleData * HnswElementTuple;
@@ -393,8 +425,8 @@ typedef struct HnswScanOpaqueData
 	HnswSupport support;
 
 	/* Filtering state */
-	bool   hasPredicateFilters;
-	int 	 numPredicates;
+	HnswFilterStateData filterState;
+	bool		hasFilter;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -438,8 +470,8 @@ List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Re
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc, int numPredicates);
-HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno, int numPredicates);
+HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
@@ -447,16 +479,19 @@ void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, in
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
-bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+void		HnswSetElementPayloadFromValues(char *base, HnswElement element, Relation index, Datum *values, bool *isnull, HnswAllocator *allocator);
+bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum *values, bool *isnull, ItemPointer heaptid, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
-void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, int numPredicates);
+void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
-void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, int numPredicates, Oid *predicateOids);
+void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
+bool		HnswInitFilterState(Relation index, MemoryContext tmpCtx, HnswFilterState filter);
+bool		HnswElementPassesFilter(HnswElement element, Relation index, HnswFilterState filter);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 int  		HnswGetNumPredicates(Relation index);
 

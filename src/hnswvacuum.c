@@ -338,7 +338,6 @@ RepairGraph(HnswVacuumState * vacuumstate)
 	Relation	index = vacuumstate->index;
 	BufferAccessStrategy bas = vacuumstate->bas;
 	BlockNumber blkno = HNSW_HEAD_BLKNO;
-	int numPredicates = HnswGetNumPredicates(index);
 
 	/*
 	 * Wait for inserts to complete. Inserts before this point may have
@@ -384,8 +383,8 @@ RepairGraph(HnswVacuumState * vacuumstate)
 				continue;
 
 			/* Create an element */
-			element = HnswInitElementFromBlock(blkno, offno, numPredicates);
-			HnswLoadElementFromTuple(element, etup, false, true, numPredicates);
+			element = HnswInitElementFromBlock(blkno, offno);
+			HnswLoadElementFromTuple(element, etup, false, true);
 
 			elements = lappend(elements, element);
 		}

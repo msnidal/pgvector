@@ -278,6 +278,15 @@ CREATE FUNCTION hnsw_bit_support(internal) RETURNS internal
 CREATE FUNCTION hnsw_sparsevec_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION hnsw_set_filter(regclass, text, text, text) RETURNS void
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION hnsw_clear_filter(regclass) RETURNS void
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION hnsw_clear_filters() RETURNS void
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
 -- vector opclasses
 
 CREATE OPERATOR CLASS vector_ops
