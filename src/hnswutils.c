@@ -630,7 +630,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
  * Load an element and optionally get its distance from q
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, IndexScanDesc filterScan)
 {
 	Buffer		buf;
 	Page		page;
@@ -645,6 +645,12 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	etup = (HnswElementTuple) PageGetItem(page, itemid);
 
 	Assert(HnswIsElementTuple(etup));
+
+	if (filterScan != NULL && !HnswCheckMatches(index, etup, filterScan))
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
 
 	/* Calculate distance */
 	if (distance != NULL)
@@ -683,7 +689,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
 }
 
 bool
@@ -1013,7 +1019,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
 	bool		inMemory = index == NULL;
-	bool		acornFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0 && lc == 0;
+	bool		acornFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
 	int			maxUnvisited = inMemory ? lm : (acornFilter ? lm + (lm * lm) : lm);
 	HnswUnvisited *unvisited = palloc(maxUnvisited * sizeof(HnswUnvisited));
 	int			unvisitedLength;
@@ -1112,7 +1118,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
 				maxDistance = (alwaysAdd || discarded != NULL || acornFilter) ? NULL : &f->distance;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, acornFilter ? q->scan : NULL);
 
 				if (eElement == NULL)
 					continue;
