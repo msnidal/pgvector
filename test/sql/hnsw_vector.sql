@@ -87,13 +87,28 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 
 DROP TABLE t;
 
+-- multicolumn
+
+CREATE TABLE t (val vector(3), tenant_id int, category int);
+INSERT INTO t (val, tenant_id, category) VALUES ('[0,0,0]', 1, 10), ('[1,2,3]', 2, 20), ('[2,2,2]', 1, 30), ('[3,3,3]', 3, 40);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops, tenant_id vector_integer_ops, category vector_integer_ops);
+
+SELECT tenant_id, category FROM t WHERE tenant_id = 1 ORDER BY val <-> '[3,3,3]' LIMIT 2;
+SELECT tenant_id, category FROM t WHERE category = 30 ORDER BY val <-> '[3,3,3]' LIMIT 2;
+SELECT tenant_id, category FROM t WHERE tenant_id >= 2 ORDER BY val <-> '[0,0,0]' LIMIT 2;
+
+DROP TABLE t;
+
 -- options
 
 CREATE TABLE t (val vector(3));
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 1);
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 101);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (aux_m = -2);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (aux_m = 101);
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (ef_construction = 3);
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (ef_construction = 1001);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, aux_m = 32, ef_construction = 64);
 CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (m = 16, ef_construction = 31);
 
 SHOW hnsw.ef_search;

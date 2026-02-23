@@ -4,17 +4,25 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/itup.h"
+#include "access/relscan.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
+#include "utils/builtins.h"
+#include "utils/float.h"
+#include "utils/lsyscache.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -135,6 +143,20 @@ HnswGetEfConstruction(Relation index)
 }
 
 /*
+ * Get total auxiliary connections
+ */
+int
+HnswGetAuxM(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->auxM >= 0 ? opts->auxM : opts->m;
+
+	return HNSW_DEFAULT_M;
+}
+
+/*
  * Get proc
  */
 FmgrInfo *
@@ -227,6 +249,28 @@ HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloca
 }
 
 /*
+ * Allocate auxiliary neighbors
+ */
+static void
+HnswInitAuxNeighbors(char *base, HnswElement element, int m, int auxM, int natts, HnswAllocator * allocator)
+{
+	int			auxAttrs = HnswGetAuxAttributeCount(natts);
+	HnswNeighborArrayPtr *auxList;
+
+	if (auxAttrs == 0)
+	{
+		HnswPtrStore(base, element->auxNeighbors, (HnswNeighborArrayPtr *) NULL);
+		return;
+	}
+
+	auxList = (HnswNeighborArrayPtr *) HnswAlloc(allocator, sizeof(HnswNeighborArrayPtr) * auxAttrs);
+	HnswPtrStore(base, element->auxNeighbors, auxList);
+
+	for (AttrNumber attno = 2; attno <= natts; attno++)
+		HnswPtrStore(base, auxList[attno - 2], HnswInitNeighborArray(HnswGetAuxMForAttno(auxM, natts, attno), allocator));
+}
+
+/*
  * Allocate memory from the allocator
  */
 void *
@@ -242,7 +286,7 @@ HnswAlloc(HnswAllocator * allocator, Size size)
  * Allocate an element
  */
 HnswElement
-HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator)
+HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, int natts, int auxM, HnswAllocator * allocator)
 {
 	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
 
@@ -261,8 +305,10 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	element->version = 1;
 
 	HnswInitNeighbors(base, element, m, allocator);
+	HnswInitAuxNeighbors(base, element, m, auxM, natts, allocator);
 
-	HnswPtrStore(base, element->value, (char *) NULL);
+	HnswPtrStore(base, element->value, (Pointer) NULL);
+	HnswPtrStore(base, element->itup, (IndexTuple) NULL);
 
 	return element;
 }
@@ -288,7 +334,9 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 	element->blkno = blkno;
 	element->offno = offno;
 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
-	HnswPtrStore(base, element->value, (char *) NULL);
+	HnswPtrStore(base, element->auxNeighbors, (HnswNeighborArrayPtr *) NULL);
+	HnswPtrStore(base, element->value, (Pointer) NULL);
+	HnswPtrStore(base, element->itup, (IndexTuple) NULL);
 	return element;
 }
 
@@ -309,6 +357,9 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
+
+	if (unlikely(metap->version != HNSW_VERSION))
+		elog(ERROR, "hnsw index version not supported");
 
 	if (m != NULL)
 		*m = metap->m;
@@ -428,17 +479,48 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 }
 
 /*
+ * Get the tuple descriptor
+ */
+TupleDesc
+HnswTupleDesc(Relation index)
+{
+	TupleDesc	tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(index));
+
+	/* Prevent compression */
+	TupleDescAttr(tupdesc, 0)->attstorage = TYPSTORAGE_PLAIN;
+
+	return tupdesc;
+}
+
+/*
+ * Form an index tuple
+ */
+IndexTuple
+HnswFormIndexTuple(Relation index, TupleDesc tupdesc, Datum value, Datum *values, bool *isnull)
+{
+	Size		size = sizeof(Datum) * IndexRelationGetNumberOfAttributes(index);
+	Datum	   *newValues = palloc(size);
+
+	memcpy(newValues, values, size);
+	newValues[0] = value;
+
+	return index_form_tuple(tupdesc, newValues, isnull);
+}
+
+/*
  * Set element tuple, except for neighbor info
  */
 void
 HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
 	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	IndexTuple	itup = HnswPtrAccess(base, element->itup);
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
-	etup->deleted = 0;
+	etup->deleted = element->deleted;
 	etup->version = element->version;
+
 	for (int i = 0; i < HNSW_HEAPTIDS; i++)
 	{
 		if (i < element->heaptidsLength)
@@ -446,14 +528,18 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+	if (itup != NULL)
+		memcpy(&etup->data, itup, IndexTupleSize(itup));
+	else
+		memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
 }
 
 /*
  * Set neighbor tuple
  */
 void
-HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
+HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, int auxM, int natts)
 {
 	int			idx = 0;
 
@@ -480,6 +566,27 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 		}
 	}
 
+	for (AttrNumber attno = 2; attno <= natts; attno++)
+	{
+		int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+		HnswNeighborArray *auxNeighbors = HnswGetAuxNeighbors(base, e, attno);
+
+		for (int i = 0; i < am; i++)
+		{
+			ItemPointer indextid = &ntup->indextids[idx++];
+
+			if (auxNeighbors != NULL && i < auxNeighbors->length)
+			{
+				HnswCandidate *hc = &auxNeighbors->items[i];
+				HnswElement hce = HnswPtrAccess(base, hc->element);
+
+				ItemPointerSet(indextid, hce->blkno, hce->offno);
+			}
+			else
+				ItemPointerSetInvalid(indextid);
+		}
+	}
+
 	ntup->count = idx;
 	ntup->version = e->version;
 }
@@ -488,7 +595,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
  * Load an element from a tuple
  */
 void
-HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec)
+HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, Relation index)
 {
 	element->level = etup->level;
 	element->deleted = etup->deleted;
@@ -512,10 +619,93 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	if (loadVec)
 	{
 		char	   *base = NULL;
-		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
-		HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
+		if (IndexRelationGetNumberOfAttributes(index) > 1)
+		{
+			TupleDesc	tupdesc = RelationGetDescr(index);
+			bool		isnull;
+			IndexTuple	itup = CopyIndexTuple((IndexTuple) &etup->data);
+			Datum		value = index_getattr(itup, 1, tupdesc, &isnull);
+
+			HnswPtrStore(base, element->itup, itup);
+			HnswPtrStore(base, element->value, DatumGetPointer(value));
+		}
+		else
+		{
+			Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+
+			HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
+		}
 	}
+
+	{
+		char	   *base = NULL;
+
+		if (!loadVec)
+		{
+			HnswPtrStore(base, element->auxNeighbors, (HnswNeighborArrayPtr *) NULL);
+			HnswPtrStore(base, element->itup, (IndexTuple) NULL);
+			HnswPtrStore(base, element->value, (Pointer) NULL);
+		}
+	}
+}
+
+static bool
+HnswCheckMatches(Relation index, HnswElementTuple etup, IndexScanDesc scan)
+{
+	if (scan == NULL)
+		return true;
+
+	if (IndexRelationGetNumberOfAttributes(index) == 1)
+		return true;
+
+	for (int i = 0; i < scan->numberOfKeys; i++)
+	{
+		IndexTuple	itup = (IndexTuple) &etup->data;
+		TupleDesc	tupdesc = RelationGetDescr(index);
+		ScanKey		key = &scan->keyData[i];
+		bool		isnull;
+		Datum		value = index_getattr(itup, key->sk_attno, tupdesc, &isnull);
+		bool		attnull = key->sk_flags & SK_ISNULL;
+
+		if (isnull || attnull)
+		{
+			if (isnull != attnull)
+				return false;
+		}
+		else if (!DatumGetBool(FunctionCall2Coll(&key->sk_func, key->sk_collation, value, key->sk_argument)))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Select an auxiliary edge attribute from scan keys
+ */
+static AttrNumber
+HnswGetAuxScanAttno(IndexScanDesc scan, int natts)
+{
+	AttrNumber	attno = InvalidAttrNumber;
+
+	if (scan == NULL || scan->numberOfKeys == 0)
+		return InvalidAttrNumber;
+
+	for (int i = 0; i < scan->numberOfKeys; i++)
+	{
+		ScanKey		key = &scan->keyData[i];
+
+		if (key->sk_attno <= 1 || key->sk_attno > natts)
+			continue;
+
+		if (key->sk_strategy != HNSW_EQUAL_STRATEGY)
+			continue;
+
+		if (attno == InvalidAttrNumber || key->sk_attno < attno)
+			attno = key->sk_attno;
+	}
+
+	return attno;
 }
 
 /*
@@ -531,26 +721,44 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
  * Load an element and optionally get its distance from q
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, IndexScanDesc scan, bool *matches)
 {
 	Buffer		buf;
 	Page		page;
+	ItemId		itemid;
 	HnswElementTuple etup;
+	bool		tupleMatches = true;
 
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	itemid = PageGetItemId(page, offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
 
 	Assert(HnswIsElementTuple(etup));
+
+	if (scan != NULL)
+		tupleMatches = HnswCheckMatches(index, etup, scan);
+
+	if (matches != NULL)
+		*matches = tupleMatches;
 
 	/* Calculate distance */
 	if (distance != NULL)
 	{
+		Datum		value;
+
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
+		else if (IndexRelationGetNumberOfAttributes(index) > 1)
+		{
+			TupleDesc	tupdesc = RelationGetDescr(index);
+			bool		isnull;
+
+			value = index_getattr((IndexTuple) &etup->data, 1, tupdesc, &isnull);
+			*distance = HnswGetDistance(q->value, value, support);
+		}
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}
@@ -561,7 +769,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 		if (*element == NULL)
 			*element = HnswInitElementFromBlock(blkno, offno);
 
-		HnswLoadElementFromTuple(*element, etup, true, loadVec);
+		HnswLoadElementFromTuple(*element, etup, true, loadVec, index);
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -573,7 +781,135 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL, NULL);
+}
+
+bool
+HnswElementMatchesScan(HnswElement element, Relation index, IndexScanDesc scan)
+{
+	Buffer		buf;
+	Page		page;
+	ItemId		itemid;
+	HnswElementTuple etup;
+	bool		matches;
+
+	buf = ReadBuffer(index, element->blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	itemid = PageGetItemId(page, element->offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
+
+	matches = HnswCheckMatches(index, etup, scan);
+
+	UnlockReleaseBuffer(buf);
+
+	return matches;
+}
+
+/*
+ * Check if two loaded elements have the same payload attributes
+ */
+static bool
+HnswElementPayloadEquals(Relation index, IndexTuple itupA, IndexTuple itupB, AttrNumber attno)
+{
+	TupleDesc	tupdesc = RelationGetDescr(index);
+	Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
+	bool		isnullA;
+	bool		isnullB;
+	Datum		valueA = index_getattr(itupA, attno, tupdesc, &isnullA);
+	Datum		valueB = index_getattr(itupB, attno, tupdesc, &isnullB);
+
+	if (isnullA || isnullB)
+		return isnullA == isnullB;
+
+	if (!datum_image_eq(valueA, valueB, attr->attbyval, attr->attlen))
+		return false;
+
+	return true;
+}
+
+/*
+ * Build auxiliary Path B edges from payload-matching neighbors
+ */
+void
+HnswFindElementAuxNeighbors(char *base, HnswElement element, Relation index, HnswSupport * support, int m, int auxM)
+{
+	int			natts;
+	HnswNeighborArray *neighbors;
+	Datum		value;
+	IndexTuple	itupA;
+
+	if (index == NULL)
+		return;
+
+	natts = IndexRelationGetNumberOfAttributes(index);
+	if (natts == 1)
+		return;
+
+	itupA = HnswPtrAccess(base, element->itup);
+	if (itupA == NULL)
+		return;
+
+	neighbors = HnswGetNeighbors(base, element, 0);
+	value = HnswGetValue(base, element);
+
+	for (AttrNumber attno = 2; attno <= natts; attno++)
+	{
+		int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+		HnswNeighborArray *auxNeighbors;
+
+		if (am == 0)
+			continue;
+
+		auxNeighbors = HnswGetAuxNeighbors(base, element, attno);
+
+		for (int i = 0; i < neighbors->length; i++)
+		{
+			HnswCandidate *hc = &neighbors->items[i];
+			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
+			IndexTuple	itupB = HnswPtrAccess(base, neighborElement->itup);
+			float		distance;
+
+			if (itupB == NULL)
+				continue;
+
+			if (neighborElement == element)
+				continue;
+
+			if (!HnswElementPayloadEquals(index, itupA, itupB, attno))
+				continue;
+
+			distance = HnswGetDistance(value, HnswGetValue(base, neighborElement), support);
+			HnswUpdateConnection(base, auxNeighbors, neighborElement, distance, am, NULL, index, support);
+
+			/* In-memory builds can cheaply add one extra hop */
+			if (base == NULL)
+				continue;
+
+			{
+				HnswNeighborArray *next = HnswGetNeighbors(base, neighborElement, 0);
+
+				for (int j = 0; j < next->length; j++)
+				{
+					HnswCandidate *nextHc = &next->items[j];
+					HnswElement nextElement = HnswPtrAccess(base, nextHc->element);
+					IndexTuple	itupNext = HnswPtrAccess(base, nextElement->itup);
+
+					if (itupNext == NULL)
+						continue;
+
+					if (nextElement == element)
+						continue;
+
+					if (!HnswElementPayloadEquals(index, itupA, itupNext, attno))
+						continue;
+
+					distance = HnswGetDistance(value, HnswGetValue(base, nextElement), support);
+					HnswUpdateConnection(base, auxNeighbors, nextElement, distance, am, NULL, index, support);
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -591,12 +927,13 @@ GetElementDistance(char *base, HnswElement element, HnswQuery * q, HnswSupport *
  * Allocate a search candidate
  */
 static HnswSearchCandidate *
-HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+HnswInitSearchCandidate(char *base, HnswElement element, double distance, bool matches_scan)
 {
 	HnswSearchCandidate *sc = palloc(sizeof(HnswSearchCandidate));
 
 	HnswPtrStore(base, sc->element, element);
 	sc->distance = distance;
+	sc->matches_scan = matches_scan;
 	return sc;
 }
 
@@ -608,13 +945,15 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
 {
 	bool		inMemory = index == NULL;
 	double		distance;
+	bool		matches_scan = true;
+	bool		checkFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
 
 	if (inMemory)
 		distance = GetElementDistance(base, entryPoint, q, support);
 	else
-		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+		HnswLoadElementImpl(entryPoint->blkno, entryPoint->offno, &distance, q, index, support, loadVec, NULL, &entryPoint, checkFilter ? q->scan : NULL, checkFilter ? &matches_scan : NULL);
 
-	return HnswInitSearchCandidate(base, entryPoint, distance);
+	return HnswInitSearchCandidate(base, entryPoint, distance, matches_scan);
 }
 
 /*
@@ -657,6 +996,21 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 		return -1;
 
 	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Compare matched candidate distances
+ */
+static int
+CompareFurthestMatchedCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	if (HnswGetSearchCandidateConst(m_node, a)->distance < HnswGetSearchCandidateConst(m_node, b)->distance)
+		return -1;
+
+	if (HnswGetSearchCandidateConst(m_node, a)->distance > HnswGetSearchCandidateConst(m_node, b)->distance)
 		return 1;
 
 	return 0;
@@ -726,7 +1080,7 @@ CountElement(HnswElement skipElement, HnswElement e)
  * Load unvisited neighbors from memory
  */
 static void
-HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize)
+HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize, int maxNeighbors)
 {
 	/* Get the neighborhood at layer lc */
 	HnswNeighborArray *neighborhood = HnswGetNeighbors(base, element, lc);
@@ -738,7 +1092,7 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
 
 	*unvisitedLength = 0;
 
-	for (int i = 0; i < localNeighborhood->length; i++)
+	for (int i = 0; i < localNeighborhood->length && i < maxNeighbors; i++)
 	{
 		HnswCandidate *hc = &localNeighborhood->items[i];
 		bool		found;
@@ -746,20 +1100,25 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
 		AddToVisited(base, v, hc->element, true, &found);
 
 		if (!found)
-			unvisited[(*unvisitedLength)++].element = HnswPtrAccess(base, hc->element);
+		{
+			unvisited[*unvisitedLength].val.element = HnswPtrAccess(base, hc->element);
+			unvisited[*unvisitedLength].isAux = false;
+			(*unvisitedLength)++;
+		}
 	}
 }
 
 /*
- * Load neighbor index TIDs
+ * Load neighbor index TIDs (base and optionally auxiliary)
  */
-bool
-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
+static bool
+HnswLoadAllNeighborTids(HnswElement element, ItemPointerData *indextids, ItemPointerData *auxIndextids, Relation index, int m, int auxM, int lm, int lc, AttrNumber auxAttno)
 {
 	Buffer		buf;
 	Page		page;
 	HnswNeighborTuple ntup;
 	int			start;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
 
 	buf = ReadBuffer(index, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -771,7 +1130,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	 * Ensure the neighbor tuple has not been deleted or replaced between
 	 * index scan iterations
 	 */
-	if (ntup->version != element->version || ntup->count != (element->level + 2) * m)
+	if (ntup->version != element->version || ntup->count != (element->level + 2) * m + HnswGetAuxTotalM(auxM, natts))
 	{
 		UnlockReleaseBuffer(buf);
 		return false;
@@ -781,6 +1140,54 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	start = (element->level - lc) * m;
 	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
 
+	if (auxIndextids != NULL && auxAttno != InvalidAttrNumber)
+	{
+		int am = HnswGetAuxMForAttno(auxM, natts, auxAttno);
+		int auxStart = HnswGetAuxOffset(element->level, m, auxM, natts, auxAttno);
+		memcpy(auxIndextids, ntup->indextids + auxStart, am * sizeof(ItemPointerData));
+	}
+
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/*
+ * Load neighbor index TIDs
+ */
+bool
+HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int auxM, int lm, int lc)
+{
+	return HnswLoadAllNeighborTids(element, indextids, NULL, index, m, auxM, lm, lc, InvalidAttrNumber);
+}
+
+/*
+ * Load auxiliary neighbor index TIDs
+ */
+bool
+HnswLoadAuxNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int auxM, AttrNumber attno)
+{
+	Buffer		buf;
+	Page		page;
+	HnswNeighborTuple ntup;
+	int			start;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+
+	buf = ReadBuffer(index, element->neighborPage);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
+
+	if (ntup->version != element->version || ntup->count != (element->level + 2) * m + HnswGetAuxTotalM(auxM, natts))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	start = HnswGetAuxOffset(element->level, m, auxM, natts, attno);
+	memcpy(indextids, ntup->indextids + start, am * sizeof(ItemPointerData));
+
 	UnlockReleaseBuffer(buf);
 	return true;
 }
@@ -789,14 +1196,25 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
  * Load unvisited neighbors from disk
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int auxM, int lm, int lc, int maxUnvisited, AttrNumber auxAttno)
 {
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
+	ItemPointerData *auxIndextids = NULL;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			am = HnswGetAuxMForAttno(auxM, natts, auxAttno);
 
 	*unvisitedLength = 0;
 
-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	if (auxAttno != InvalidAttrNumber && am > 0)
+		auxIndextids = palloc(am * sizeof(ItemPointerData));
+
+	if (!HnswLoadAllNeighborTids(element, indextids, auxIndextids, index, m, auxM, lm, lc, auxAttno))
+	{
+		pfree(indextids);
+		if (auxIndextids != NULL)
+			pfree(auxIndextids);
 		return;
+	}
 
 	for (int i = 0; i < lm; i++)
 	{
@@ -808,9 +1226,38 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 		tidhash_insert(v->tids, *indextid, &found);
 
-		if (!found)
-			unvisited[(*unvisitedLength)++].indextid = *indextid;
+		if (!found && *unvisitedLength < maxUnvisited)
+		{
+			unvisited[*unvisitedLength].val.indextid = *indextid;
+			unvisited[*unvisitedLength].isAux = false;
+			(*unvisitedLength)++;
+		}
 	}
+
+	if (auxIndextids != NULL)
+	{
+		for (int i = 0; i < am; i++)
+		{
+			ItemPointer indextid = &auxIndextids[i];
+			bool		found;
+
+			if (!ItemPointerIsValid(indextid))
+				break;
+
+			tidhash_insert(v->tids, *indextid, &found);
+
+			if (!found && *unvisitedLength < maxUnvisited)
+			{
+				unvisited[*unvisitedLength].val.indextid = *indextid;
+				unvisited[*unvisitedLength].isAux = true;
+				(*unvisitedLength)++;
+			}
+		}
+
+		pfree(auxIndextids);
+	}
+
+	pfree(indextids);
 }
 
 /*
@@ -822,15 +1269,29 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	pairingheap *M = NULL;
 	int			wlen = 0;
+	int			mlen = 0;
+	int			prefilterHops = 0;
 	visited_hash vh;
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
-	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+	int			natts = inMemory ? 1 : IndexRelationGetNumberOfAttributes(index);
+	int			auxM = inMemory ? 0 : HnswGetAuxM(index);
+	int			totalAuxM = HnswGetAuxTotalM(auxM, natts);
+	int			maxNeighbors = lm + totalAuxM;
+	bool		checkFilter = !inMemory && lc == 0 && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
+	bool		prefilter = checkFilter && discarded == NULL;
+	AttrNumber	auxAttno = prefilter ? HnswGetAuxScanAttno(q->scan, natts) : InvalidAttrNumber;
+	bool		useAux = auxAttno != InvalidAttrNumber;
+	HnswUnvisited *unvisited = palloc(maxNeighbors * sizeof(HnswUnvisited));
+	int			unvisitedLength;
+
+	if (prefilter)
+		M = pairingheap_allocate(CompareFurthestMatchedCandidates, NULL);
 
 	if (v == NULL)
 	{
@@ -877,24 +1338,72 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		 * affect insert performance.
 		 */
 		if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+		{
 			wlen++;
+
+			if (checkFilter)
+			{
+				/* Re-evaluate for elements from previous layer if needed */
+				if (sc->matches_scan && !inMemory)
+					sc->matches_scan = HnswElementMatchesScan(HnswPtrAccess(base, sc->element), index, q->scan);
+
+				if (prefilter && sc->matches_scan)
+				{
+					pairingheap_add(M, &sc->m_node);
+					if (mlen < ef)
+						mlen++;
+					else
+						pairingheap_remove_first(M);
+				}
+			}
+		}
 	}
 
 	while (!pairingheap_is_empty(C))
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
-		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswSearchCandidate *f;
+		HnswSearchCandidate *fw;
 		HnswElement cElement;
 
-		if (c->distance > f->distance)
-			break;
+		if (prefilter)
+		{
+			fw = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+
+			if (mlen >= ef)
+			{
+				f = HnswGetSearchCandidate(m_node, pairingheap_first(M));
+				if (c->distance > f->distance)
+					break;
+			}
+			else if (wlen >= ef && c->distance > fw->distance)
+			{
+				if (!c->matches_scan)
+				{
+					if (prefilterHops >= ef)
+						break;
+
+					prefilterHops++;
+				}
+			}
+		}
+		else
+		{
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			if (c->distance > f->distance)
+				break;
+		}
 
 		cElement = HnswPtrAccess(base, c->element);
 
 		if (inMemory)
-			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize, lm);
 		else
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+		{
+			bool		currentMatches = useAux && HnswElementMatchesScan(cElement, index, q->scan);
+
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, auxM, lm, lc, maxNeighbors, currentMatches ? auxAttno : InvalidAttrNumber);
+		}
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -905,47 +1414,59 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswElement eElement;
 			HnswSearchCandidate *e;
 			double		eDistance;
+			bool		isAux = unvisited[i].isAux;
 			bool		alwaysAdd = wlen < ef;
+			double	   *maxDistance;
+			bool		matches = true;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
+			if (prefilter && mlen < ef && prefilterHops < ef)
+			{
+				if (isAux)
+					alwaysAdd = true;
+				else if (wlen >= ef && eDistance < f->distance * 2.0)
+					alwaysAdd = true;
+			}
+
 			if (inMemory)
 			{
-				eElement = unvisited[i].element;
+				eElement = unvisited[i].val.element;
 				eDistance = GetElementDistance(base, eElement, q, support);
 			}
 			else
 			{
-				ItemPointer indextid = &unvisited[i].indextid;
+				ItemPointer indextid = &unvisited[i].val.indextid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				maxDistance = (alwaysAdd || discarded != NULL) ? NULL : &f->distance;
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, checkFilter ? q->scan : NULL, checkFilter ? &matches : NULL);
 
 				if (eElement == NULL)
 					continue;
-			}
-
-			if (!(eDistance < f->distance || alwaysAdd))
-			{
-				if (discarded != NULL)
-				{
-					/* Create a new candidate */
-					e = HnswInitSearchCandidate(base, eElement, eDistance);
-					pairingheap_add(*discarded, &e->w_node);
-				}
-
-				continue;
 			}
 
 			/* Make robust to issues */
 			if (eElement->level < lc)
 				continue;
 
+			if (!(eDistance < f->distance || alwaysAdd))
+			{
+				if (discarded != NULL)
+				{
+					/* Create a new candidate */
+					e = HnswInitSearchCandidate(base, eElement, eDistance, matches);
+					pairingheap_add(*discarded, &e->w_node);
+				}
+
+				continue;
+			}
+
 			/* Create a new candidate */
-			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			e = HnswInitSearchCandidate(base, eElement, eDistance, matches);
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
 
@@ -966,16 +1487,37 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);
 				}
+
+				if (prefilter && matches)
+				{
+					pairingheap_add(M, &e->m_node);
+					if (mlen < ef)
+						mlen++;
+					else
+						pairingheap_remove_first(M);
+				}
 			}
 		}
 	}
 
-	/* Add each element of W to w */
-	while (!pairingheap_is_empty(W))
+	/* Add each element to w */
+	if (prefilter)
 	{
-		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+		while (!pairingheap_is_empty(M))
+		{
+			HnswSearchCandidate *sc = HnswGetSearchCandidate(m_node, pairingheap_remove_first(M));
 
-		w = lappend(w, sc);
+			w = lappend(w, sc);
+		}
+	}
+	else
+	{
+		while (!pairingheap_is_empty(W))
+		{
+			HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+			w = lappend(w, sc);
+		}
 	}
 
 	return w;
@@ -1284,6 +1826,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	bool		inMemory = index == NULL;
 
 	q.value = HnswGetValue(base, element);
+	q.scan = NULL;
 
 	/* Precompute hash */
 	if (inMemory)

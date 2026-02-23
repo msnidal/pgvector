@@ -152,6 +152,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
+	so->q.scan = NULL;
 
 	scan->opaque = so;
 
@@ -173,12 +174,15 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
+	so->q.scan = NULL;
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
 
 	if (orderbys && scan->numberOfOrderBys > 0)
 		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
+
+	so->q.scan = scan;
 }
 
 /*
@@ -291,6 +295,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		sc = llast(so->w);
 		element = HnswPtrAccess(base, sc->element);
 
+		if (scan->numberOfKeys > 0 && !sc->matches_scan)
+		{
+			so->w = list_delete_last(so->w);
+
+			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			{
+				pfree(element);
+				pfree(sc);
+			}
+
+			continue;
+		}
+
 		/* Move to next element if no valid heap TIDs */
 		if (element->heaptidsLength == 0)
 		{
@@ -319,7 +336,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		MemoryContextSwitchTo(oldCtx);
 
 		scan->xs_heaptid = *heaptid;
-		scan->xs_recheck = false;
+		scan->xs_recheck = scan->numberOfKeys > 0;
 		scan->xs_recheckorderby = false;
 		return true;
 	}

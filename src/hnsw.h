@@ -6,6 +6,7 @@
 #include <math.h>
 
 #include "access/genam.h"
+#include "access/itup.h"
 #include "access/parallel.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
@@ -42,6 +43,9 @@ typedef Pointer Item;
 #define HNSW_DEFAULT_M	16
 #define HNSW_MIN_M	2
 #define HNSW_MAX_M		100
+#define HNSW_DEFAULT_AUX_M	-1
+#define HNSW_MIN_AUX_M		-1
+#define HNSW_MAX_AUX_M		100
 #define HNSW_DEFAULT_EF_CONSTRUCTION	64
 #define HNSW_MIN_EF_CONSTRUCTION	4
 #define HNSW_MAX_EF_CONSTRUCTION		1000
@@ -59,6 +63,8 @@ typedef Pointer Item;
 #define HNSW_UPDATE_ENTRY_GREATER 1
 #define HNSW_UPDATE_ENTRY_ALWAYS 2
 
+#define HNSW_EQUAL_STRATEGY 4
+
 /* Build phases */
 /* PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE is 1 */
 #define PROGRESS_HNSW_PHASE_LOAD		2
@@ -66,8 +72,8 @@ typedef Pointer Item;
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
-#define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
-#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
+#define HNSW_ELEMENT_TUPLE_SIZE(size) MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m, am)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + (((level) + 2) * (m) + (am)) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
 
@@ -92,7 +98,7 @@ typedef Pointer Item;
 #define HnswGetMl(m) (1 / log(m))
 
 /* Ensure fits on page and in uint8 */
-#define HnswGetMaxLevel(m) Min(((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - offsetof(HnswNeighborTupleData, indextids) - sizeof(ItemIdData)) / (sizeof(ItemPointerData)) / (m)) - 2, 255)
+#define HnswGetMaxLevel(m, am) Max(Min(((((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - offsetof(HnswNeighborTupleData, indextids) - sizeof(ItemIdData)) / (sizeof(ItemPointerData))) - (am)) / (m)) - 3, 255), 0)
 
 #define HnswGetSearchCandidate(membername, ptr) pairingheap_container(HnswSearchCandidate, membername, ptr)
 #define HnswGetSearchCandidateConst(membername, ptr) pairingheap_const_container(HnswSearchCandidate, membername, ptr)
@@ -140,6 +146,7 @@ HnswPtrDeclare(HnswElementData, HnswElementRelptr, HnswElementPtr);
 HnswPtrDeclare(HnswNeighborArray, HnswNeighborArrayRelptr, HnswNeighborArrayPtr);
 HnswPtrDeclare(HnswNeighborArrayPtr, HnswNeighborsRelptr, HnswNeighborsPtr);
 HnswPtrDeclare(char, DatumRelptr, DatumPtr);
+HnswPtrDeclare(IndexTupleData, IndexTupleRelptr, IndexTuplePtr);
 
 struct HnswElementData
 {
@@ -156,6 +163,8 @@ struct HnswElementData
 	OffsetNumber neighborOffno;
 	BlockNumber neighborPage;
 	DatumPtr	value;
+	IndexTuplePtr itup;
+	HnswNeighborsPtr auxNeighbors;
 	LWLock		lock;
 };
 
@@ -179,8 +188,10 @@ typedef struct HnswSearchCandidate
 {
 	pairingheap_node c_node;
 	pairingheap_node w_node;
+	pairingheap_node m_node;
 	HnswElementPtr element;
 	double		distance;
+	bool		matches_scan;
 }			HnswSearchCandidate;
 
 /* HNSW index options */
@@ -189,6 +200,7 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	int			auxM;			/* total auxiliary connections */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -267,6 +279,7 @@ typedef struct HnswSupport
 typedef struct HnswQuery
 {
 	Datum		value;
+	IndexScanDesc scan;
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -281,6 +294,7 @@ typedef struct HnswBuildState
 	/* Settings */
 	int			dimensions;
 	int			m;
+	int			auxM;
 	int			efConstruction;
 
 	/* Statistics */
@@ -305,6 +319,9 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+
+	/* Tuple descriptor for multicolumn indexes */
+	TupleDesc	tupdesc;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -362,10 +379,13 @@ typedef union
 	struct tidhash_hash *tids;
 }			visited_hash;
 
-typedef union
+typedef struct
 {
-	HnswElement element;
-	ItemPointerData indextid;
+	union {
+		HnswElement element;
+		ItemPointerData indextid;
+	} val;
+	bool isAux;
 }			HnswUnvisited;
 
 typedef struct HnswScanOpaqueData
@@ -415,6 +435,7 @@ typedef struct HnswVacuumState
 
 /* Methods */
 int			HnswGetM(Relation index);
+int			HnswGetAuxM(Relation index);
 int			HnswGetEfConstruction(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
@@ -427,23 +448,28 @@ List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Re
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, int natts, int auxM, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
+void		HnswFindElementAuxNeighbors(char *base, HnswElement element, Relation index, HnswSupport * support, int m, int auxM);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
-void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
+void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, int auxM, int natts);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
-bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum *values, bool *isnull, ItemPointer heaptid, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
-void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
+void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, Relation index);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
+bool		HnswElementMatchesScan(HnswElement element, Relation index, IndexScanDesc scan);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
+TupleDesc	HnswTupleDesc(Relation index);
+IndexTuple	HnswFormIndexTuple(Relation index, TupleDesc tupdesc, Datum value, Datum *values, bool *isnull);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
-bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
+bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int auxM, int lm, int lc);
+bool		HnswLoadAuxNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int auxM, AttrNumber attno);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
@@ -472,6 +498,62 @@ HnswGetNeighbors(char *base, HnswElement element, int lc)
 	Assert(element->level >= lc);
 
 	return HnswPtrAccess(base, neighborList[lc]);
+}
+
+static inline HnswNeighborArray *
+HnswGetAuxNeighbors(char *base, HnswElement element, AttrNumber attno)
+{
+	HnswNeighborArrayPtr *auxList = HnswPtrAccess(base, element->auxNeighbors);
+
+	Assert(attno >= 2);
+
+	return HnswPtrAccess(base, auxList[attno - 2]);
+}
+
+static inline int
+HnswGetAuxAttributeCount(int natts)
+{
+	return Max(natts - 1, 0);
+}
+
+static inline int
+HnswGetAuxTotalM(int auxM, int natts)
+{
+	return HnswGetAuxAttributeCount(natts) > 0 ? Max(auxM, 0) : 0;
+}
+
+static inline int
+HnswGetAuxMForAttno(int auxM, int natts, AttrNumber attno)
+{
+	int			auxAttrs = HnswGetAuxAttributeCount(natts);
+	int			attidx;
+	int			total;
+	int			base;
+	int			extra;
+
+	if (auxAttrs == 0)
+		return 0;
+
+	if (attno < 2 || attno > natts)
+		return 0;
+
+	attidx = attno - 2;
+	total = HnswGetAuxTotalM(auxM, natts);
+	base = total / auxAttrs;
+	extra = total % auxAttrs;
+
+	return base + (attidx < extra ? 1 : 0);
+}
+
+static inline int
+HnswGetAuxOffset(int level, int m, int auxM, int natts, AttrNumber attno)
+{
+	int			start = (level + 2) * m;
+
+	for (AttrNumber att = 2; att < attno; att++)
+		start += HnswGetAuxMForAttno(auxM, natts, att);
+
+	return start;
 }
 
 /* Hash tables */

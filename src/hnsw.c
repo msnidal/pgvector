@@ -86,6 +86,8 @@ HnswInit(void)
 	hnsw_relopt_kind = add_reloption_kind();
 	add_int_reloption(hnsw_relopt_kind, "m", "Max number of connections",
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
+	add_int_reloption(hnsw_relopt_kind, "aux_m", "Total number of auxiliary connections for filtered routing",
+					  HNSW_DEFAULT_AUX_M, HNSW_MIN_AUX_M, HNSW_MAX_AUX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 
@@ -239,6 +241,7 @@ hnswoptions(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
+		{"aux_m", RELOPT_TYPE_INT, offsetof(HnswOptions, auxM)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
 	};
 
@@ -279,7 +282,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 		.amconsistentordering = false,
 		.amcanbackward = false,
 		.amcanunique = false,
-		.amcanmulticol = false,
+		.amcanmulticol = true,
 		.amoptionalkey = true,
 		.amsearcharray = false,
 		.amsearchnulls = false,
@@ -338,7 +341,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->amcanbackward = false;	/* can change direction mid-scan */
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
+	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;

@@ -2,17 +2,21 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/itup.h"
 #include "hnsw.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
+
+static void HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
 
 /*
  * Get the insert page
@@ -161,13 +165,18 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	BlockNumber newInsertPage = InvalidBlockNumber;
 	uint8		tupleVersion;
 	char	   *base = NULL;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			auxM = HnswGetAuxM(index);
+	int			am = HnswGetAuxTotalM(auxM, natts);
 
-	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
-	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
+	if (HnswPtrAccess(base, e->itup) != NULL)
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, e->itup)));
+	else
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m, am);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
-	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + sizeof(ItemIdData);
+	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m, am) + sizeof(ItemIdData);
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
@@ -175,7 +184,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 
 	/* Prepare neighbor tuple */
 	ntup = palloc0(ntupSize);
-	HnswSetNeighborTuple(base, ntup, e, m);
+	HnswSetNeighborTuple(base, ntup, e, m, auxM, natts);
 
 	/* Find a page (or two if needed) to insert the tuples */
 	for (;;)
@@ -349,14 +358,17 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
  * Load neighbors
  */
 static HnswNeighborArray *
-HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
+HnswLoadNeighbors(HnswElement element, Relation index, int m, int auxM, int lm, int lc)
 {
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
 
-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	if (!HnswLoadNeighborTids(element, indextids, index, m, auxM, lm, lc))
+	{
+		pfree(indextids);
 		return neighbors;
+	}
 
 	for (int i = 0; i < lm; i++)
 	{
@@ -371,6 +383,45 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 		hc = &neighbors->items[neighbors->length++];
 		HnswPtrStore(base, hc->element, e);
 	}
+
+	pfree(indextids);
+
+	return neighbors;
+}
+
+/*
+ * Load auxiliary neighbors
+ */
+static HnswNeighborArray *
+HnswLoadAuxNeighbors(HnswElement element, Relation index, int m, int auxM, AttrNumber attno)
+{
+	char	   *base = NULL;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+	HnswNeighborArray *neighbors = HnswInitNeighborArray(am, NULL);
+	ItemPointerData *indextids = palloc(am * sizeof(ItemPointerData));
+
+	if (!HnswLoadAuxNeighborTids(element, indextids, index, m, auxM, attno))
+	{
+		pfree(indextids);
+		return neighbors;
+	}
+
+	for (int i = 0; i < am; i++)
+	{
+		ItemPointer indextid = &indextids[i];
+		HnswElement e;
+		HnswCandidate *hc;
+
+		if (!ItemPointerIsValid(indextid))
+			break;
+
+		e = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
+		hc = &neighbors->items[neighbors->length++];
+		HnswPtrStore(base, hc->element, e);
+	}
+
+	pfree(indextids);
 
 	return neighbors;
 }
@@ -417,7 +468,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 	 * selecting neighbors can take time. Could use optimistic locking to
 	 * retry if another update occurs before getting exclusive lock.
 	 */
-	neighbors = HnswLoadNeighbors(element, index, m, lm, lc);
+	neighbors = HnswLoadNeighbors(element, index, m, HnswGetAuxM(index), lm, lc);
 
 	/*
 	 * Could improve performance for vacuuming by checking neighbors against
@@ -433,11 +484,48 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 		HnswQuery	q;
 
 		q.value = HnswGetValue(base, element);
+		q.scan = NULL;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
 		if (idx == -1)
 			HnswUpdateConnection(base, neighbors, newElement, distance, lm, &idx, index, support);
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(updateCtx);
+
+	return idx;
+}
+
+/*
+ * Get update index for auxiliary neighbors
+ */
+static int
+GetAuxUpdateIndex(HnswElement element, HnswElement newElement, float distance, int m, int auxM, Relation index, AttrNumber attno, HnswSupport * support, MemoryContext updateCtx)
+{
+	char	   *base = NULL;
+	int			idx = -1;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+	HnswNeighborArray *neighbors;
+	MemoryContext oldCtx = MemoryContextSwitchTo(updateCtx);
+
+	neighbors = HnswLoadAuxNeighbors(element, index, m, auxM, attno);
+
+	if (neighbors->length < am)
+		idx = -2;
+	else
+	{
+		HnswQuery	q;
+
+		q.value = HnswGetValue(base, element);
+		q.scan = NULL;
+
+		LoadElementsForInsert(neighbors, &q, &idx, index, support);
+
+		if (idx == -1)
+			HnswUpdateConnection(base, neighbors, newElement, distance, am, &idx, index, support);
 	}
 
 	MemoryContextSwitchTo(oldCtx);
@@ -539,6 +627,70 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 }
 
 /*
+ * Update auxiliary neighbor
+ */
+static void
+UpdateAuxNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m, int auxM, Relation index, AttrNumber attno, bool checkExisting, bool building)
+{
+	Buffer		buf;
+	Page		page;
+	GenericXLogState *state;
+	HnswNeighborTuple ntup;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			lm = HnswGetAuxMForAttno(auxM, natts, attno);
+	int			startIdx;
+	OffsetNumber offno = element->neighborOffno;
+
+	buf = ReadBuffer(index, element->neighborPage);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (building)
+	{
+		state = NULL;
+		page = BufferGetPage(buf);
+	}
+	else
+	{
+		state = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(state, buf, 0);
+	}
+
+	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, offno));
+	startIdx = HnswGetAuxOffset(element->level, m, auxM, natts, attno);
+
+	if (checkExisting && ConnectionExists(newElement, ntup, startIdx, lm))
+		idx = -1;
+	else if (idx == -2)
+	{
+		for (int j = 0; j < lm; j++)
+		{
+			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
+			{
+				idx = startIdx + j;
+				break;
+			}
+		}
+	}
+	else
+		idx += startIdx;
+
+	if (idx >= 0 && idx < ntup->count)
+	{
+		ItemPointer indextid = &ntup->indextids[idx];
+
+		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
+
+		if (building)
+			MarkBufferDirty(buf);
+		else
+			GenericXLogFinish(state);
+	}
+	else if (!building)
+		GenericXLogAbort(state);
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Update neighbors
  */
 void
@@ -572,6 +724,57 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 				continue;
 
 			UpdateNeighborOnDisk(neighborElement, e, idx, m, lm, lc, index, checkExisting, building);
+		}
+	}
+
+	HnswUpdateAuxNeighborsOnDisk(index, support, e, m, checkExisting, building);
+
+	MemoryContextDelete(updateCtx);
+}
+
+/*
+ * Update auxiliary neighbors
+ */
+static void
+HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building)
+{
+	char	   *base = NULL;
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+	int			auxM = HnswGetAuxM(index);
+	MemoryContext updateCtx;
+
+	if (natts == 1)
+		return;
+
+	updateCtx = GenerationContextCreate(CurrentMemoryContext,
+									  "Hnsw insert aux update context",
+#if PG_VERSION_NUM >= 150000
+									  128 * 1024, 128 * 1024,
+#endif
+									  128 * 1024);
+
+	for (AttrNumber attno = 2; attno <= natts; attno++)
+	{
+		int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+		HnswNeighborArray *auxNeighbors;
+
+		if (am == 0)
+			continue;
+
+		auxNeighbors = HnswGetAuxNeighbors(base, e, attno);
+
+		for (int i = 0; i < auxNeighbors->length; i++)
+		{
+			HnswCandidate *hc = &auxNeighbors->items[i];
+			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
+			int			idx;
+
+			idx = GetAuxUpdateIndex(neighborElement, e, hc->distance, m, auxM, index, attno, support, updateCtx);
+
+			if (idx == -1)
+				continue;
+
+			UpdateAuxNeighborOnDisk(neighborElement, e, idx, m, auxM, index, attno, checkExisting, building);
 		}
 	}
 
@@ -670,7 +873,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
 	/* Look for duplicate */
-	if (FindDuplicateOnDisk(index, element, building))
+	if (IndexRelationGetNumberOfAttributes(index) == 1 && FindDuplicateOnDisk(index, element, building))
 		return;
 
 	/* Add element */
@@ -692,11 +895,12 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
  * Insert a tuple into the index
  */
 bool
-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum *values, bool *isnull, ItemPointer heaptid, bool building)
 {
 	HnswElement entryPoint;
 	HnswElement element;
 	int			m;
+	int			auxM;
 	int			efConstruction = HnswGetEfConstruction(index);
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
@@ -710,10 +914,22 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 
 	/* Get m and entry point */
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	auxM = HnswGetAuxM(index);
 
 	/* Create an element */
-	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
-	HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
+	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m, HnswGetAuxTotalM(auxM, IndexRelationGetNumberOfAttributes(index))), IndexRelationGetNumberOfAttributes(index), auxM, NULL);
+	if (IndexRelationGetNumberOfAttributes(index) > 1)
+	{
+		TupleDesc	tupdesc = HnswTupleDesc(index);
+		bool		isnull1;
+		IndexTuple	itup = HnswFormIndexTuple(index, tupdesc, value, values, isnull);
+
+		HnswPtrStore(base, element->itup, itup);
+		HnswPtrStore(base, element->value, DatumGetPointer(index_getattr(itup, 1, tupdesc, &isnull1)));
+		FreeTupleDesc(tupdesc);
+	}
+	else
+		HnswPtrStore(base, element->value, DatumGetPointer(value));
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -731,6 +947,7 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 
 	/* Find neighbors for element */
 	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
+	HnswFindElementAuxNeighbors(base, element, index, support, m, auxM);
 
 	/* Update graph on disk */
 	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);
@@ -757,7 +974,7 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;
 
-	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
+	HnswInsertTupleOnDisk(index, &support, value, values, isnull, heaptid, false);
 }
 
 /*
