@@ -37,6 +37,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/itup.h"
 #include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
@@ -54,9 +55,13 @@
 #include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/typcache.h"
+#include "nodes/pg_list.h"
+#include "nodes/nodeFuncs.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -152,6 +157,8 @@ CreateGraphPages(HnswBuildState * buildstate)
 	HnswNeighborTuple ntup;
 	BlockNumber insertPage;
 	HnswElement entryPoint;
+	int			natts = buildstate->indexInfo->ii_NumIndexAttrs;
+	int			am = HnswGetAuxTotalM(buildstate->auxM, natts);
 	Buffer		buf;
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
@@ -183,9 +190,11 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Zero memory for each element */
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
-		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+		if (HnswPtrAccess(base, element->itup) != NULL)
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, element->itup)));
+		else
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m, am);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
@@ -251,6 +260,8 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
 	int			m = buildstate->m;
+	int			natts = buildstate->indexInfo->ii_NumIndexAttrs;
+	int			am = HnswGetAuxTotalM(buildstate->auxM, natts);
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
 	HnswNeighborTuple ntup;
@@ -263,7 +274,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		HnswElement element = HnswPtrAccess(base, iter);
 		Buffer		buf;
 		Page		page;
-		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m, am);
 
 		/* Update iterator */
 		iter = element->next;
@@ -279,7 +290,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 
-		HnswSetNeighborTuple(base, ntup, element, m);
+		HnswSetNeighborTuple(base, ntup, element, m, buildstate->auxM, natts);
 
 		if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
@@ -403,6 +414,39 @@ UpdateNeighborsInMemory(char *base, HnswSupport * support, HnswElement e, int m)
 }
 
 /*
+ * Update auxiliary neighbors
+ */
+static void
+UpdateAuxNeighborsInMemory(char *base, HnswSupport * support, HnswElement e, int m, int auxM, Relation index)
+{
+	int			natts = IndexRelationGetNumberOfAttributes(index);
+
+	if (natts == 1)
+		return;
+
+	for (AttrNumber attno = 2; attno <= natts; attno++)
+	{
+		int			am = HnswGetAuxMForAttno(auxM, natts, attno);
+		HnswNeighborArray *auxNeighbors;
+
+		if (am == 0)
+			continue;
+
+		auxNeighbors = HnswGetAuxNeighbors(base, e, attno);
+
+		for (int i = 0; i < auxNeighbors->length; i++)
+		{
+			HnswCandidate *hc = &auxNeighbors->items[i];
+			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
+
+			LWLockAcquire(&neighborElement->lock, LW_EXCLUSIVE);
+			HnswUpdateConnection(base, HnswGetAuxNeighbors(base, neighborElement, attno), e, hc->distance, am, NULL, index, support);
+			LWLockRelease(&neighborElement->lock);
+		}
+	}
+}
+
+/*
  * Update graph in memory
  */
 static void
@@ -412,14 +456,17 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, HnswEleme
 	char	   *base = buildstate->hnswarea;
 
 	/* Look for duplicate */
-	if (FindDuplicateInMemory(base, element))
+	if (buildstate->indexInfo->ii_NumIndexAttrs == 1 && FindDuplicateInMemory(base, element))
 		return;
+
+	HnswFindElementAuxNeighbors(base, element, buildstate->index, support, m, buildstate->auxM);
 
 	/* Add element */
 	AddElementInMemory(base, graph, element);
 
 	/* Update neighbors */
 	UpdateNeighborsInMemory(base, support, element, m);
+	UpdateAuxNeighborsInMemory(base, support, element, m, buildstate->auxM, buildstate->index);
 
 	/* Update entry point if needed (already have lock) */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -505,7 +552,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
 	/*
@@ -537,12 +584,28 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
 	/* Ok, we can proceed to allocate the element */
-	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
-	valuePtr = HnswAlloc(allocator, valueSize);
+	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, buildstate->indexInfo->ii_NumIndexAttrs, buildstate->auxM, allocator);
+	if (buildstate->indexInfo->ii_NumIndexAttrs > 1)
+	{
+		bool		isnull1;
+		IndexTuple	itup = HnswFormIndexTuple(index, buildstate->tupdesc, value, values, isnull);
+		Size		itupSize = IndexTupleSize(itup);
+		IndexTuple	itupCopy = HnswAlloc(allocator, itupSize);
+
+		memcpy(itupCopy, itup, itupSize);
+		pfree(itup);
+
+		HnswPtrStore(base, element->itup, itupCopy);
+		HnswPtrStore(base, element->value, DatumGetPointer(index_getattr(itupCopy, 1, buildstate->tupdesc, &isnull1)));
+	}
+	else
+	{
+		valuePtr = HnswAlloc(allocator, valueSize);
+	}
 
 	/*
 	 * We have now allocated the space needed for the element, so we don't
@@ -552,8 +615,11 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	LWLockRelease(&graph->allocatorLock);
 
 	/* Copy the datum */
-	memcpy(valuePtr, DatumGetPointer(value), valueSize);
-	HnswPtrStore(base, element->value, (char *) valuePtr);
+	if (buildstate->indexInfo->ii_NumIndexAttrs == 1)
+	{
+		memcpy(valuePtr, DatumGetPointer(value), valueSize);
+		HnswPtrStore(base, element->value, valuePtr);
+	}
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -671,6 +737,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->typeInfo = HnswGetTypeInfo(index);
 
 	buildstate->m = HnswGetM(index);
+	buildstate->auxM = HnswGetAuxM(index);
 	buildstate->efConstruction = HnswGetEfConstruction(index);
 	buildstate->dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
 
@@ -705,7 +772,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
 	buildstate->graph = &buildstate->graphData;
 	buildstate->ml = HnswGetMl(buildstate->m);
-	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m, HnswGetAuxTotalM(buildstate->auxM, indexInfo->ii_NumIndexAttrs));
 
 	buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
 												   "Hnsw build graph context",
@@ -722,6 +789,9 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
+	buildstate->tupdesc = NULL;
+	if (indexInfo->ii_NumIndexAttrs > 1)
+		buildstate->tupdesc = HnswTupleDesc(index);
 }
 
 /*
@@ -732,6 +802,8 @@ FreeBuildState(HnswBuildState * buildstate)
 {
 	MemoryContextDelete(buildstate->graphCtx);
 	MemoryContextDelete(buildstate->tmpCtx);
+	if (buildstate->tupdesc != NULL)
+		FreeTupleDesc(buildstate->tupdesc);
 }
 
 /*

@@ -203,10 +203,11 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	Page		page;
 	GenericXLogState *state;
 	int			m = vacuumstate->m;
+	int			auxM = HnswGetAuxM(index);
 	int			efConstruction = vacuumstate->efConstruction;
 	BufferAccessStrategy bas = vacuumstate->bas;
 	HnswNeighborTuple ntup = vacuumstate->ntup;
-	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m, HnswGetAuxTotalM(auxM, IndexRelationGetNumberOfAttributes(index)));
 	char	   *base = NULL;
 
 	/* Skip if element is entry point */
@@ -219,13 +220,14 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 
 	/* Find neighbors for element, skipping itself */
 	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, true);
+	HnswFindElementAuxNeighbors(base, element, index, support, m, auxM);
 
 	/* Zero memory for each element */
 	MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 	/* Update neighbor tuple */
 	/* Do this before getting page to minimize locking */
-	HnswSetNeighborTuple(base, ntup, element, m);
+	HnswSetNeighborTuple(base, ntup, element, m, auxM, IndexRelationGetNumberOfAttributes(index));
 
 	/* Get neighbor page */
 	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
@@ -384,7 +386,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
 
 			/* Create an element */
 			element = HnswInitElementFromBlock(blkno, offno);
-			HnswLoadElementFromTuple(element, etup, false, true);
+			HnswLoadElementFromTuple(element, etup, false, true, index);
 
 			elements = lappend(elements, element);
 		}
