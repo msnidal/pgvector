@@ -219,8 +219,8 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	element->heaptidsLength = 0;
 
 	/* Find neighbors for element, skipping itself */
-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, true);
-	HnswFindElementAuxNeighbors(base, element, index, support, m, auxM);
+	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, true, false);
+	HnswFindElementAuxNeighbors(base, element, entryPoint, NULL, index, support, m, auxM, efConstruction, true, false);
 
 	/* Zero memory for each element */
 	MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);

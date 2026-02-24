@@ -114,6 +114,128 @@ hash_offset(Size offset)
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+static uint32
+HnswDatumHash(Datum value, bool isnull, bool attbyval, int attlen)
+{
+	uint32 hash = 0;
+	if (isnull)
+		return 0;
+
+	if (attbyval)
+	{
+		unsigned char *p = (unsigned char *) &value;
+		int len = attlen > 0 ? attlen : sizeof(Datum);
+		for (int i = 0; i < len; i++)
+			hash = hash * 31 + p[i];
+		return murmurhash32(hash);
+	}
+	else
+	{
+		unsigned char *s = (unsigned char *) DatumGetPointer(value);
+		int			size;
+
+		if (attlen > 0)
+			size = attlen;
+		else if (attlen == -1)
+			size = VARSIZE_ANY(s);
+		else
+			size = strlen((char *) s) + 1;
+
+		for (int i = 0; i < size; i++)
+			hash = hash * 31 + s[i];
+		return murmurhash32(hash);
+	}
+}
+
+typedef struct HnswEpCacheKey
+{
+	AttrNumber	attno;
+	uint32		hash_value;
+} HnswEpCacheKey;
+
+typedef struct HnswEpCacheEntry
+{
+	HnswEpCacheKey key;
+	char		status;
+	HnswElement element;
+} HnswEpCacheEntry;
+
+static inline uint32
+hash_ep_key(HnswEpCacheKey key)
+{
+	return murmurhash32(key.hash_value ^ key.attno);
+}
+
+static inline bool
+ep_key_equal(HnswEpCacheKey a, HnswEpCacheKey b)
+{
+	return a.attno == b.attno && a.hash_value == b.hash_value;
+}
+
+#define SH_PREFIX		epcache
+#define SH_ELEMENT_TYPE	HnswEpCacheEntry
+#define SH_KEY_TYPE		HnswEpCacheKey
+#define SH_KEY			key
+#define SH_HASH_KEY(tb, key)	hash_ep_key(key)
+#define SH_EQUAL(tb, a, b)		ep_key_equal(a, b)
+#define SH_SCOPE		extern
+#define SH_DEFINE
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
+struct epcache_hash *
+HnswInitEpCache(MemoryContext ctx)
+{
+	return epcache_create(ctx, 128, NULL);
+}
+
+void
+HnswFreeEpCache(struct epcache_hash *cache)
+{
+	if (cache)
+		epcache_destroy(cache);
+}
+
+HnswElement
+HnswGetCachedEntryPoint(struct epcache_hash *cache, AttrNumber attno, Datum value, bool isnull, TupleDesc tupdesc)
+{
+	HnswEpCacheKey key;
+	HnswEpCacheEntry *entry;
+	Form_pg_attribute attr;
+
+	if (cache == NULL || attno == InvalidAttrNumber)
+		return NULL;
+
+	attr = TupleDescAttr(tupdesc, attno - 1);
+	key.attno = attno;
+	key.hash_value = HnswDatumHash(value, isnull, attr->attbyval, attr->attlen);
+
+	entry = epcache_lookup(cache, key);
+	if (entry)
+		return entry->element;
+
+	return NULL;
+}
+
+void
+HnswSetCachedEntryPoint(struct epcache_hash *cache, AttrNumber attno, Datum value, bool isnull, TupleDesc tupdesc, HnswElement element)
+{
+	HnswEpCacheKey key;
+	HnswEpCacheEntry *entry;
+	Form_pg_attribute attr;
+	bool		found;
+
+	if (cache == NULL || attno == InvalidAttrNumber || element == NULL)
+		return;
+
+	attr = TupleDescAttr(tupdesc, attno - 1);
+	key.attno = attno;
+	key.hash_value = HnswDatumHash(value, isnull, attr->attbyval, attr->attlen);
+
+	entry = epcache_insert(cache, key, &found);
+	entry->element = element;
+}
+
 /*
  * Get the max number of connections in an upper layer for each element in the index
  */
@@ -651,6 +773,28 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 }
 
 static bool
+HnswElementMatchesInsertFilter(char *base, HnswElement element, Relation index, HnswQuery *q)
+{
+	IndexTuple	itup = HnswPtrAccess(base, element->itup);
+	bool		isnull;
+	Datum		value;
+	TupleDesc	tupdesc;
+	Form_pg_attribute attr;
+
+	if (itup == NULL || index == NULL || q == NULL || q->filterAttno == InvalidAttrNumber)
+		return false;
+
+	tupdesc = RelationGetDescr(index);
+	attr = TupleDescAttr(tupdesc, q->filterAttno - 1);
+	value = index_getattr(itup, q->filterAttno, tupdesc, &isnull);
+
+	if (isnull || q->filterIsnull)
+		return isnull == q->filterIsnull;
+
+	return datum_image_eq(value, q->filterValue, attr->attbyval, attr->attlen);
+}
+
+static bool
 HnswCheckMatches(Relation index, HnswElementTuple etup, IndexScanDesc scan)
 {
 	if (scan == NULL)
@@ -829,15 +973,15 @@ HnswElementPayloadEquals(Relation index, IndexTuple itupA, IndexTuple itupB, Att
 }
 
 /*
- * Build auxiliary Path B edges from payload-matching neighbors
+ * Build auxiliary Path A edges by performing an attribute-constrained search
  */
 void
-HnswFindElementAuxNeighbors(char *base, HnswElement element, Relation index, HnswSupport * support, int m, int auxM)
+HnswFindElementAuxNeighbors(char *base, HnswElement element, HnswElement entryPoint, struct epcache_hash *ep_cache, Relation index, HnswSupport * support, int m, int auxM, int efConstruction, bool existing, bool inMemory)
 {
 	int			natts;
-	HnswNeighborArray *neighbors;
 	Datum		value;
 	IndexTuple	itupA;
+	HnswElement skipElement = existing ? element : NULL;
 
 	if (index == NULL)
 		return;
@@ -850,65 +994,93 @@ HnswFindElementAuxNeighbors(char *base, HnswElement element, Relation index, Hns
 	if (itupA == NULL)
 		return;
 
-	neighbors = HnswGetNeighbors(base, element, 0);
 	value = HnswGetValue(base, element);
 
 	for (AttrNumber attno = 2; attno <= natts; attno++)
 	{
 		int			am = HnswGetAuxMForAttno(auxM, natts, attno);
 		HnswNeighborArray *auxNeighbors;
+		HnswQuery	q;
+		TupleDesc	tupdesc;
+		bool		isnull;
+		List	   *ep;
+		List	   *w;
+		int			entryLevel;
+		ListCell   *lc2;
 
 		if (am == 0)
 			continue;
 
 		auxNeighbors = HnswGetAuxNeighbors(base, element, attno);
 
-		for (int i = 0; i < neighbors->length; i++)
-		{
-			HnswCandidate *hc = &neighbors->items[i];
-			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
-			IndexTuple	itupB = HnswPtrAccess(base, neighborElement->itup);
-			float		distance;
+		tupdesc = RelationGetDescr(index);
+		q.value = value;
+		q.scan = NULL;
+		q.filterAttno = attno;
+		q.filterValue = index_getattr(itupA, attno, tupdesc, &isnull);
+		q.filterIsnull = isnull;
 
-			if (itupB == NULL)
-				continue;
+		/* No neighbors if no entry point */
+		if (entryPoint == NULL)
+			continue;
+
+		HnswElement epElement = entryPoint;
+		bool		foundInCache = false;
+		if (ep_cache != NULL)
+		{
+			HnswElement cachedEp = HnswGetCachedEntryPoint(ep_cache, attno, q.filterValue, isnull, tupdesc);
+			if (cachedEp != NULL)
+			{
+				epElement = cachedEp;
+				foundInCache = true;
+			}
+		}
+
+		ep = list_make1(HnswEntryCandidate(base, epElement, &q, index, support, true, inMemory));
+
+		/* 
+		 * If we found a cached entry point, it already matches the attribute.
+		 * Since auxiliary edges only exist at layer 0, navigating upper layers
+		 * is counterproductive. Skip directly to layer 0.
+		 */
+		if (!foundInCache)
+		{
+			/* 1st phase: greedy search to layer 1 */
+			for (int lc = epElement->level; lc >= 1; lc--)
+			{
+				w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, inMemory);
+				ep = w;
+			}
+		}
+
+		/* 2nd phase: search layer 0 */
+		w = HnswSearchLayer(base, &q, ep, efConstruction, 0, index, support, m, true, skipElement, NULL, NULL, true, NULL, inMemory);
+
+
+		/* Convert search candidates and add to aux neighbors */
+		foreach(lc2, w)
+		{
+			HnswSearchCandidate *sc = lfirst(lc2);
+			HnswElement neighborElement = HnswPtrAccess(base, sc->element);
 
 			if (neighborElement == element)
 				continue;
 
-			if (!HnswElementPayloadEquals(index, itupA, itupB, attno))
-				continue;
+			/* HnswSearchLayer handles the filtering, so we know it matches */
+			HnswUpdateConnection(base, auxNeighbors, neighborElement, sc->distance, am, NULL, index, support);
 
-			distance = HnswGetDistance(value, HnswGetValue(base, neighborElement), support);
-			HnswUpdateConnection(base, auxNeighbors, neighborElement, distance, am, NULL, index, support);
-
-			/* In-memory builds can cheaply add one extra hop */
-			if (base == NULL)
-				continue;
-
+			/* Add backward edge */
+			if (base != NULL)
 			{
-				HnswNeighborArray *next = HnswGetNeighbors(base, neighborElement, 0);
-
-				for (int j = 0; j < next->length; j++)
-				{
-					HnswCandidate *nextHc = &next->items[j];
-					HnswElement nextElement = HnswPtrAccess(base, nextHc->element);
-					IndexTuple	itupNext = HnswPtrAccess(base, nextElement->itup);
-
-					if (itupNext == NULL)
-						continue;
-
-					if (nextElement == element)
-						continue;
-
-					if (!HnswElementPayloadEquals(index, itupA, itupNext, attno))
-						continue;
-
-					distance = HnswGetDistance(value, HnswGetValue(base, nextElement), support);
-					HnswUpdateConnection(base, auxNeighbors, nextElement, distance, am, NULL, index, support);
-				}
+				LWLockAcquire(&neighborElement->lock, LW_EXCLUSIVE);
+				HnswUpdateConnection(base, HnswGetAuxNeighbors(base, neighborElement, attno), element, sc->distance, am, NULL, index, support);
+				LWLockRelease(&neighborElement->lock);
 			}
 		}
+
+		/* Cache this element as a future entry point for this attribute value */
+		if (ep_cache != NULL)
+			HnswSetCachedEntryPoint(ep_cache, attno, q.filterValue, isnull, tupdesc, element);
 	}
 }
 
@@ -941,9 +1113,9 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance, bool m
  * Create a candidate for the entry point
  */
 HnswSearchCandidate *
-HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec)
+HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, bool inMemory)
 {
-	bool		inMemory = index == NULL;
+	
 	double		distance;
 	bool		matches_scan = true;
 	bool		checkFilter = !inMemory && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
@@ -1264,7 +1436,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, bool inMemory)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -1278,14 +1450,16 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	bool		inMemory = index == NULL;
+	
 	int			natts = inMemory ? 1 : IndexRelationGetNumberOfAttributes(index);
 	int			auxM = inMemory ? 0 : HnswGetAuxM(index);
 	int			totalAuxM = HnswGetAuxTotalM(auxM, natts);
 	int			maxNeighbors = lm + totalAuxM;
-	bool		checkFilter = !inMemory && lc == 0 && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
+	bool		checkFilterScan = !inMemory && lc == 0 && q != NULL && q->scan != NULL && q->scan->numberOfKeys > 0;
+	bool		checkFilterInsert = lc == 0 && q != NULL && q->filterAttno != InvalidAttrNumber;
+	bool		checkFilter = checkFilterScan || checkFilterInsert;
 	bool		prefilter = checkFilter && discarded == NULL;
-	AttrNumber	auxAttno = prefilter ? HnswGetAuxScanAttno(q->scan, natts) : InvalidAttrNumber;
+	AttrNumber	auxAttno = checkFilterScan ? HnswGetAuxScanAttno(q->scan, natts) : (checkFilterInsert ? q->filterAttno : InvalidAttrNumber);
 	bool		useAux = auxAttno != InvalidAttrNumber;
 	HnswUnvisited *unvisited = palloc(maxNeighbors * sizeof(HnswUnvisited));
 	int			unvisitedLength;
@@ -1344,8 +1518,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (checkFilter)
 			{
 				/* Re-evaluate for elements from previous layer if needed */
-				if (sc->matches_scan && !inMemory)
-					sc->matches_scan = HnswElementMatchesScan(HnswPtrAccess(base, sc->element), index, q->scan);
+				if (sc->matches_scan)
+				{
+					if (checkFilterScan)
+						sc->matches_scan = HnswElementMatchesScan(HnswPtrAccess(base, sc->element), index, q->scan);
+					else if (checkFilterInsert)
+						sc->matches_scan = HnswElementMatchesInsertFilter(base, HnswPtrAccess(base, sc->element), index, q);
+				}
 
 				if (prefilter && sc->matches_scan)
 				{
@@ -1380,7 +1559,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			{
 				if (!c->matches_scan)
 				{
-					if (prefilterHops >= ef)
+					int hopLimit = ef;
+
+					if (mlen == 0)
+						hopLimit = 10000; /* Allow deep search for the first match */
+
+					if (prefilterHops >= hopLimit)
 						break;
 
 					prefilterHops++;
@@ -1420,19 +1604,34 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			bool		matches = true;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			HnswSearchCandidate *fw_eval = f;
+			HnswSearchCandidate *fm_eval = f;
 
-			if (prefilter && mlen < ef && prefilterHops < ef)
+			if (prefilter)
 			{
+				fw_eval = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+				if (mlen > 0)
+					fm_eval = HnswGetSearchCandidate(m_node, pairingheap_first(M));
+
 				if (isAux)
-					alwaysAdd = true;
-				else if (wlen >= ef && eDistance < f->distance * 2.0)
-					alwaysAdd = true;
+				{
+					if (mlen < ef)
+						alwaysAdd = true;
+				}
+				else if (mlen == 0)
+				{
+					/* Allow some base graph fan-out to find the FIRST match */
+					if (wlen >= ef)
+						alwaysAdd = true;
+				}
 			}
 
 			if (inMemory)
 			{
 				eElement = unvisited[i].val.element;
 				eDistance = GetElementDistance(base, eElement, q, support);
+				if (checkFilterInsert)
+					matches = HnswElementMatchesInsertFilter(base, eElement, index, q);
 			}
 			else
 			{
@@ -1442,18 +1641,28 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				maxDistance = (alwaysAdd || discarded != NULL) ? NULL : &f->distance;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, checkFilter ? q->scan : NULL, checkFilter ? &matches : NULL);
+				maxDistance = (alwaysAdd || discarded != NULL) ? NULL : (prefilter && isAux && mlen > 0 ? &fm_eval->distance : &fw_eval->distance);
 
-				if (eElement == NULL)
-					continue;
+				if (checkFilterInsert)
+				{
+					HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, NULL, NULL);
+					if (eElement != NULL)
+						matches = HnswElementMatchesInsertFilter(base, eElement, index, q);
+				}
+				else
+				{
+					HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, maxDistance, &eElement, checkFilterScan ? q->scan : NULL, checkFilterScan ? &matches : NULL);
+				}
 			}
 
 			/* Make robust to issues */
-			if (eElement->level < lc)
+			if (eElement == NULL || eElement->level < lc)
 				continue;
 
-			if (!(eDistance < f->distance || alwaysAdd))
+			double threshold = (prefilter && isAux && mlen > 0) ? fm_eval->distance : fw_eval->distance;
+			bool addToW = !isAux || wlen < ef || eDistance < fw_eval->distance;
+
+			if (!(eDistance < threshold || alwaysAdd))
 			{
 				if (discarded != NULL)
 				{
@@ -1468,7 +1677,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			/* Create a new candidate */
 			e = HnswInitSearchCandidate(base, eElement, eDistance, matches);
 			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
+
+			/* Only add to W if it's a spatial base node, or if we haven't filled W yet */
+			if (addToW)
+				pairingheap_add(W, &e->w_node);
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -1477,15 +1689,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			 */
 			if (CountElement(skipElement, eElement))
 			{
-				wlen++;
-
-				/* No need to decrement wlen */
-				if (wlen > ef)
+				if (addToW)
 				{
-					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+					wlen++;
 
-					if (discarded != NULL)
-						pairingheap_add(*discarded, &d->w_node);
+					/* No need to decrement wlen */
+					if (wlen > ef)
+					{
+						HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+						if (discarded != NULL)
+							pairingheap_add(*discarded, &d->w_node);
+					}
 				}
 
 				if (prefilter && matches)
@@ -1815,7 +2030,7 @@ PrecomputeHash(char *base, HnswElement element)
  * Algorithm 1 from paper
  */
 void
-HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing)
+HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing, bool inMemory)
 {
 	List	   *ep;
 	List	   *w;
@@ -1823,10 +2038,11 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	int			entryLevel;
 	HnswQuery	q;
 	HnswElement skipElement = existing ? element : NULL;
-	bool		inMemory = index == NULL;
+	
 
 	q.value = HnswGetValue(base, element);
 	q.scan = NULL;
+	q.filterAttno = InvalidAttrNumber;
 
 	/* Precompute hash */
 	if (inMemory)
@@ -1837,13 +2053,13 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		return;
 
 	/* Get entry point and level */
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true, inMemory));
 	entryLevel = entryPoint->level;
 
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, inMemory);
 		ep = w;
 	}
 
@@ -1862,7 +2078,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, inMemory);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)
