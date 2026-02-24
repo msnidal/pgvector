@@ -485,6 +485,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 
 		q.value = HnswGetValue(base, element);
 		q.scan = NULL;
+		q.filterAttno = InvalidAttrNumber;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
@@ -521,6 +522,7 @@ GetAuxUpdateIndex(HnswElement element, HnswElement newElement, float distance, i
 
 		q.value = HnswGetValue(base, element);
 		q.scan = NULL;
+		q.filterAttno = InvalidAttrNumber;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
@@ -946,8 +948,8 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, Datum 
 	}
 
 	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
-	HnswFindElementAuxNeighbors(base, element, index, support, m, auxM);
+	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false, false);
+	HnswFindElementAuxNeighbors(base, element, entryPoint, NULL, index, support, m, auxM, efConstruction, false, false);
 
 	/* Update graph on disk */
 	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);

@@ -318,6 +318,7 @@ FlushPages(HnswBuildState * buildstate)
 	WriteNeighborTuples(buildstate);
 
 	buildstate->graph->flushed = true;
+	buildstate->ep_cache = NULL; /* Cache is invalidated because elements are freed */
 	MemoryContextReset(buildstate->graphCtx);
 }
 
@@ -459,7 +460,7 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, HnswEleme
 	if (buildstate->indexInfo->ii_NumIndexAttrs == 1 && FindDuplicateInMemory(base, element))
 		return;
 
-	HnswFindElementAuxNeighbors(base, element, buildstate->index, support, m, buildstate->auxM);
+	HnswFindElementAuxNeighbors(base, element, entryPoint, buildstate->ep_cache, buildstate->index, support, m, buildstate->auxM, buildstate->efConstruction, false, true);
 
 	/* Add element */
 	AddElementInMemory(base, graph, element);
@@ -488,6 +489,9 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 	int			m = buildstate->m;
 	char	   *base = buildstate->hnswarea;
 
+	Assert(base != NULL);
+	Assert(buildstate->index != NULL);
+
 	/* Wait if another process needs exclusive lock on entry lock */
 	LWLockAcquire(entryWaitLock, LW_EXCLUSIVE);
 	LWLockRelease(entryWaitLock);
@@ -512,7 +516,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 	}
 
 	/* Find neighbors for element */
-	HnswFindElementNeighbors(base, element, entryPoint, NULL, support, m, efConstruction, false);
+	HnswFindElementNeighbors(base, element, entryPoint, buildstate->index, support, m, efConstruction, false, true);
 
 	/* Update graph in memory */
 	UpdateGraphInMemory(support, element, m, entryPoint, buildstate);
@@ -552,6 +556,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(flushLock);
 
+		elog(WARNING, "FLUSHED DUE TO MEMORY LIMIT! memoryUsed = %zu, memoryTotal = %zu", graph->memoryUsed, graph->memoryTotal);
 		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
@@ -584,6 +589,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		LWLockRelease(flushLock);
 
+		elog(WARNING, "FLUSHED DUE TO MEMORY LIMIT! memoryUsed = %zu, memoryTotal = %zu", graph->memoryUsed, graph->memoryTotal);
 		return HnswInsertTupleOnDisk(index, support, value, values, isnull, heaptid, true);
 	}
 
@@ -790,8 +796,12 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
 	buildstate->tupdesc = NULL;
+	buildstate->ep_cache = NULL;
 	if (indexInfo->ii_NumIndexAttrs > 1)
+	{
 		buildstate->tupdesc = HnswTupleDesc(index);
+		buildstate->ep_cache = HnswInitEpCache(buildstate->graphCtx);
+	}
 }
 
 /*
@@ -800,6 +810,9 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 static void
 FreeBuildState(HnswBuildState * buildstate)
 {
+	if (buildstate->ep_cache != NULL)
+		HnswFreeEpCache(buildstate->ep_cache);
+
 	MemoryContextDelete(buildstate->graphCtx);
 	MemoryContextDelete(buildstate->tmpCtx);
 	if (buildstate->tupdesc != NULL)
