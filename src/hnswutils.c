@@ -950,27 +950,6 @@ HnswElementMatchesScan(HnswElement element, Relation index, IndexScanDesc scan)
 	return matches;
 }
 
-/*
- * Check if two loaded elements have the same payload attributes
- */
-static bool
-HnswElementPayloadEquals(Relation index, IndexTuple itupA, IndexTuple itupB, AttrNumber attno)
-{
-	TupleDesc	tupdesc = RelationGetDescr(index);
-	Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
-	bool		isnullA;
-	bool		isnullB;
-	Datum		valueA = index_getattr(itupA, attno, tupdesc, &isnullA);
-	Datum		valueB = index_getattr(itupB, attno, tupdesc, &isnullB);
-
-	if (isnullA || isnullB)
-		return isnullA == isnullB;
-
-	if (!datum_image_eq(valueA, valueB, attr->attbyval, attr->attlen))
-		return false;
-
-	return true;
-}
 
 /*
  * Build auxiliary Path A edges by performing an attribute-constrained search
@@ -1005,8 +984,9 @@ HnswFindElementAuxNeighbors(char *base, HnswElement element, HnswElement entryPo
 		bool		isnull;
 		List	   *ep;
 		List	   *w;
-		int			entryLevel;
 		ListCell   *lc2;
+		HnswElement epElement = entryPoint;
+		bool		foundInCache = false;
 
 		if (am == 0)
 			continue;
@@ -1024,8 +1004,6 @@ HnswFindElementAuxNeighbors(char *base, HnswElement element, HnswElement entryPo
 		if (entryPoint == NULL)
 			continue;
 
-		HnswElement epElement = entryPoint;
-		bool		foundInCache = false;
 		if (ep_cache != NULL)
 		{
 			HnswElement cachedEp = HnswGetCachedEntryPoint(ep_cache, attno, q.filterValue, isnull, tupdesc);
@@ -1370,21 +1348,15 @@ HnswLoadAuxNeighborTids(HnswElement element, ItemPointerData *indextids, Relatio
 static void
 HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int auxM, int lm, int lc, int maxUnvisited, AttrNumber auxAttno)
 {
-	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
-	ItemPointerData *auxIndextids = NULL;
+	ItemPointerData indextids[HNSW_MAX_M * 2];
+	ItemPointerData auxIndextids[HNSW_MAX_AUX_M];
 	int			natts = IndexRelationGetNumberOfAttributes(index);
 	int			am = HnswGetAuxMForAttno(auxM, natts, auxAttno);
 
 	*unvisitedLength = 0;
 
-	if (auxAttno != InvalidAttrNumber && am > 0)
-		auxIndextids = palloc(am * sizeof(ItemPointerData));
-
-	if (!HnswLoadAllNeighborTids(element, indextids, auxIndextids, index, m, auxM, lm, lc, auxAttno))
+	if (!HnswLoadAllNeighborTids(element, indextids, (auxAttno != InvalidAttrNumber && am > 0) ? auxIndextids : NULL, index, m, auxM, lm, lc, auxAttno))
 	{
-		pfree(indextids);
-		if (auxIndextids != NULL)
-			pfree(auxIndextids);
 		return;
 	}
 
@@ -1406,7 +1378,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		}
 	}
 
-	if (auxIndextids != NULL)
+	if (auxAttno != InvalidAttrNumber && am > 0)
 	{
 		for (int i = 0; i < am; i++)
 		{
@@ -1425,11 +1397,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 				(*unvisitedLength)++;
 			}
 		}
-
-		pfree(auxIndextids);
 	}
-
-	pfree(indextids);
 }
 
 /*
@@ -1602,10 +1570,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			bool		alwaysAdd = wlen < ef;
 			double	   *maxDistance;
 			bool		matches = true;
+			double		threshold;
+			bool		addToW;
+			HnswSearchCandidate *fw_eval;
+			HnswSearchCandidate *fm_eval;
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
-			HnswSearchCandidate *fw_eval = f;
-			HnswSearchCandidate *fm_eval = f;
+			fw_eval = f;
+			fm_eval = f;
 
 			if (prefilter)
 			{
@@ -1659,8 +1631,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (eElement == NULL || eElement->level < lc)
 				continue;
 
-			double threshold = (prefilter && isAux && mlen > 0) ? fm_eval->distance : fw_eval->distance;
-			bool addToW = !isAux || wlen < ef || eDistance < fw_eval->distance;
+			threshold = (prefilter && isAux && mlen > 0) ? fm_eval->distance : fw_eval->distance;
+			addToW = !isAux || wlen < ef || eDistance < fw_eval->distance;
 
 			if (!(eDistance < threshold || alwaysAdd))
 			{

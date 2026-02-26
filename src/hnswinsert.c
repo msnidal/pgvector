@@ -16,7 +16,32 @@
 #include "varatt.h"
 #endif
 
-static void HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
+
+#define MAX_PENDING_UPDATES 4096
+
+typedef struct HnswPendingUpdate
+{
+	HnswElement neighborElement;
+	int			idx;
+	int			lm;
+	int			startIdx;
+} HnswPendingUpdate;
+
+static int
+ComparePendingUpdates(const void *a, const void *b)
+{
+	const HnswPendingUpdate *ua = (const HnswPendingUpdate *) a;
+	const HnswPendingUpdate *ub = (const HnswPendingUpdate *) b;
+
+	if (ua->neighborElement->neighborPage < ub->neighborElement->neighborPage)
+		return -1;
+	if (ua->neighborElement->neighborPage > ub->neighborElement->neighborPage)
+		return 1;
+	return 0;
+}
+
+static void HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building, HnswPendingUpdate *updates, int *num_updates);
+
 
 /*
  * Get the insert page
@@ -168,23 +193,25 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	int			natts = IndexRelationGetNumberOfAttributes(index);
 	int			auxM = HnswGetAuxM(index);
 	int			am = HnswGetAuxTotalM(auxM, natts);
+	int			active_count;
 
 	if (HnswPtrAccess(base, e->itup) != NULL)
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, e->itup)));
 	else
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m, am);
+	ntup = palloc0(ntupSize);
+	HnswSetNeighborTuple(base, ntup, e, m, auxM, natts);
+
+	active_count = ntup->count;
+	ntupSize = MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + (active_count * sizeof(ItemPointerData)));
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
-	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m, am) + sizeof(ItemIdData);
+	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m, 0) + sizeof(ItemIdData);
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
 	HnswSetElementTuple(base, etup, e);
-
-	/* Prepare neighbor tuple */
-	ntup = palloc0(ntupSize);
-	HnswSetNeighborTuple(base, ntup, e, m, auxM, natts);
 
 	/* Find a page (or two if needed) to insert the tuples */
 	for (;;)
@@ -362,11 +389,10 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int auxM, int lm, 
 {
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
-	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
+	ItemPointerData indextids[HNSW_MAX_M * 2];
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, auxM, lm, lc))
 	{
-		pfree(indextids);
 		return neighbors;
 	}
 
@@ -384,8 +410,6 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int auxM, int lm, 
 		HnswPtrStore(base, hc->element, e);
 	}
 
-	pfree(indextids);
-
 	return neighbors;
 }
 
@@ -399,11 +423,10 @@ HnswLoadAuxNeighbors(HnswElement element, Relation index, int m, int auxM, AttrN
 	int			natts = IndexRelationGetNumberOfAttributes(index);
 	int			am = HnswGetAuxMForAttno(auxM, natts, attno);
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(am, NULL);
-	ItemPointerData *indextids = palloc(am * sizeof(ItemPointerData));
+	ItemPointerData indextids[HNSW_MAX_AUX_M];
 
 	if (!HnswLoadAuxNeighborTids(element, indextids, index, m, auxM, attno))
 	{
-		pfree(indextids);
 		return neighbors;
 	}
 
@@ -420,8 +443,6 @@ HnswLoadAuxNeighbors(HnswElement element, Relation index, int m, int auxM, AttrN
 		hc = &neighbors->items[neighbors->length++];
 		HnswPtrStore(base, hc->element, e);
 	}
-
-	pfree(indextids);
 
 	return neighbors;
 }
@@ -544,7 +565,11 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 {
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &ntup->indextids[startIdx + i];
+		ItemPointer indextid;
+
+		if (startIdx + i >= ntup->count)
+			break;
+		indextid = &ntup->indextids[startIdx + i];
 
 		if (!ItemPointerIsValid(indextid))
 			break;
@@ -556,141 +581,7 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 	return false;
 }
 
-/*
- * Update neighbor
- */
-static void
-UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m, int lm, int lc, Relation index, bool checkExisting, bool building)
-{
-	Buffer		buf;
-	Page		page;
-	GenericXLogState *state;
-	HnswNeighborTuple ntup;
-	int			startIdx;
-	OffsetNumber offno = element->neighborOffno;
 
-	/* Register page */
-	buf = ReadBuffer(index, element->neighborPage);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	if (building)
-	{
-		state = NULL;
-		page = BufferGetPage(buf);
-	}
-	else
-	{
-		state = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(state, buf, 0);
-	}
-
-	/* Get tuple */
-	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, offno));
-
-	/* Calculate index for update */
-	startIdx = (element->level - lc) * m;
-
-	/* Check for existing connection */
-	if (checkExisting && ConnectionExists(newElement, ntup, startIdx, lm))
-		idx = -1;
-	else if (idx == -2)
-	{
-		/* Find free offset if still exists */
-		/* TODO Retry updating connections if not */
-		for (int j = 0; j < lm; j++)
-		{
-			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
-			{
-				idx = startIdx + j;
-				break;
-			}
-		}
-	}
-	else
-		idx += startIdx;
-
-	/* Make robust to issues */
-	if (idx >= 0 && idx < ntup->count)
-	{
-		ItemPointer indextid = &ntup->indextids[idx];
-
-		/* Update neighbor on the buffer */
-		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
-
-		/* Commit */
-		if (building)
-			MarkBufferDirty(buf);
-		else
-			GenericXLogFinish(state);
-	}
-	else if (!building)
-		GenericXLogAbort(state);
-
-	UnlockReleaseBuffer(buf);
-}
-
-/*
- * Update auxiliary neighbor
- */
-static void
-UpdateAuxNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m, int auxM, Relation index, AttrNumber attno, bool checkExisting, bool building)
-{
-	Buffer		buf;
-	Page		page;
-	GenericXLogState *state;
-	HnswNeighborTuple ntup;
-	int			natts = IndexRelationGetNumberOfAttributes(index);
-	int			lm = HnswGetAuxMForAttno(auxM, natts, attno);
-	int			startIdx;
-	OffsetNumber offno = element->neighborOffno;
-
-	buf = ReadBuffer(index, element->neighborPage);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	if (building)
-	{
-		state = NULL;
-		page = BufferGetPage(buf);
-	}
-	else
-	{
-		state = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(state, buf, 0);
-	}
-
-	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, offno));
-	startIdx = HnswGetAuxOffset(element->level, m, auxM, natts, attno);
-
-	if (checkExisting && ConnectionExists(newElement, ntup, startIdx, lm))
-		idx = -1;
-	else if (idx == -2)
-	{
-		for (int j = 0; j < lm; j++)
-		{
-			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
-			{
-				idx = startIdx + j;
-				break;
-			}
-		}
-	}
-	else
-		idx += startIdx;
-
-	if (idx >= 0 && idx < ntup->count)
-	{
-		ItemPointer indextid = &ntup->indextids[idx];
-
-		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
-
-		if (building)
-			MarkBufferDirty(buf);
-		else
-			GenericXLogFinish(state);
-	}
-	else if (!building)
-		GenericXLogAbort(state);
-
-	UnlockReleaseBuffer(buf);
-}
 
 /*
  * Update neighbors
@@ -699,6 +590,12 @@ void
 HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building)
 {
 	char	   *base = NULL;
+	HnswPendingUpdate updates[MAX_PENDING_UPDATES];
+	int			num_updates = 0;
+	BlockNumber current_blkno = InvalidBlockNumber;
+	GenericXLogState *state = NULL;
+	Buffer		buf = InvalidBuffer;
+	Page		page = NULL;
 
 	/* Use separate memory context to improve performance for larger vectors */
 	MemoryContext updateCtx = GenerationContextCreate(CurrentMemoryContext,
@@ -725,20 +622,128 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 			if (idx == -1)
 				continue;
 
-			UpdateNeighborOnDisk(neighborElement, e, idx, m, lm, lc, index, checkExisting, building);
+			if (num_updates < MAX_PENDING_UPDATES)
+			{
+				updates[num_updates].neighborElement = neighborElement;
+				updates[num_updates].idx = idx;
+				updates[num_updates].lm = lm;
+				updates[num_updates].startIdx = (neighborElement->level - lc) * m;
+				num_updates++;
+			}
 		}
 	}
 
-	HnswUpdateAuxNeighborsOnDisk(index, support, e, m, checkExisting, building);
+	HnswUpdateAuxNeighborsOnDisk(index, support, e, m, checkExisting, building, updates, &num_updates);
 
 	MemoryContextDelete(updateCtx);
+
+	if (num_updates == 0)
+		return;
+
+	qsort(updates, num_updates, sizeof(HnswPendingUpdate), ComparePendingUpdates);
+
+	for (int i = 0; i < num_updates; i++)
+	{
+		HnswPendingUpdate *u = &updates[i];
+		HnswElement element = u->neighborElement;
+		HnswNeighborTuple ntup;
+		int idx = u->idx;
+		int lm = u->lm;
+		int startIdx = u->startIdx;
+
+		if (element->neighborPage != current_blkno)
+		{
+			if (state != NULL)
+			{
+				GenericXLogFinish(state);
+				state = NULL;
+			}
+			if (BufferIsValid(buf))
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
+
+			current_blkno = element->neighborPage;
+			buf = ReadBuffer(index, current_blkno);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+			if (!building)
+			{
+				state = GenericXLogStart(index);
+				page = GenericXLogRegisterBuffer(state, buf, 0);
+			}
+			else
+				page = BufferGetPage(buf);
+		}
+
+		ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
+
+		if (checkExisting && ConnectionExists(e, ntup, startIdx, lm))
+			idx = -1;
+		else if (idx == -2)
+		{
+			for (int j = 0; j < lm; j++)
+			{
+				if (startIdx + j >= ntup->count || !ItemPointerIsValid(&ntup->indextids[startIdx + j]))
+				{
+					idx = startIdx + j;
+					break;
+				}
+			}
+		}
+		else if (idx >= 0)
+			idx += startIdx;
+
+		if (idx >= 0)
+		{
+			if (idx >= ntup->count)
+			{
+				Size oldSize = MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + (ntup->count * sizeof(ItemPointerData)));
+				int new_count = idx + 1;
+				Size newSize = MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + (new_count * sizeof(ItemPointerData)));
+
+				if (PageGetExactFreeSpace(page) >= (newSize - oldSize))
+				{
+					HnswNeighborTuple new_ntup = palloc0(newSize);
+					memcpy(new_ntup, ntup, oldSize);
+					new_ntup->count = new_count;
+
+					for (int k = ntup->count; k < new_count; k++)
+						ItemPointerSetInvalid(&new_ntup->indextids[k]);
+
+					ItemPointerSet(&new_ntup->indextids[idx], e->blkno, e->offno);
+
+					PageIndexTupleDeleteNoCompact(page, element->neighborOffno);
+					PageRepairFragmentation(page);
+
+					if (PageAddItem(page, (Item) new_ntup, newSize, element->neighborOffno, true, false) != element->neighborOffno)
+					{
+						if (!building)
+							GenericXLogAbort(state);
+						elog(ERROR, "Failed to expand dynamically sized HNSW tuple");
+					}
+					pfree(new_ntup);
+				}
+			}
+			else
+			{
+				ItemPointerSet(&ntup->indextids[idx], e->blkno, e->offno);
+			}
+		}
+	}
+
+	if (state != NULL)
+		GenericXLogFinish(state);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 }
 
 /*
  * Update auxiliary neighbors
  */
 static void
-HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building)
+HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building, HnswPendingUpdate *updates, int *num_updates)
 {
 	char	   *base = NULL;
 	int			natts = IndexRelationGetNumberOfAttributes(index);
@@ -776,7 +781,14 @@ HnswUpdateAuxNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement 
 			if (idx == -1)
 				continue;
 
-			UpdateAuxNeighborOnDisk(neighborElement, e, idx, m, auxM, index, attno, checkExisting, building);
+			if (*num_updates < MAX_PENDING_UPDATES)
+			{
+				updates[*num_updates].neighborElement = neighborElement;
+				updates[*num_updates].idx = idx;
+				updates[*num_updates].lm = am;
+				updates[*num_updates].startIdx = HnswGetAuxOffset(neighborElement->level, m, auxM, natts, attno);
+				(*num_updates)++;
+			}
 		}
 	}
 
