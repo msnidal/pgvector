@@ -193,6 +193,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	int			natts = IndexRelationGetNumberOfAttributes(index);
 	int			auxM = HnswGetAuxM(index);
 	int			am = HnswGetAuxTotalM(auxM, natts);
+	int			active_count;
 
 	if (HnswPtrAccess(base, e->itup) != NULL)
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(IndexTupleSize(HnswPtrAccess(base, e->itup)));
@@ -202,7 +203,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	ntup = palloc0(ntupSize);
 	HnswSetNeighborTuple(base, ntup, e, m, auxM, natts);
 
-	int active_count = ntup->count;
+	active_count = ntup->count;
 	ntupSize = MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + (active_count * sizeof(ItemPointerData)));
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -388,11 +389,10 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int auxM, int lm, 
 {
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
-	ItemPointerData *indextids = palloc(lm * sizeof(ItemPointerData));
+	ItemPointerData indextids[HNSW_MAX_M * 2];
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, auxM, lm, lc))
 	{
-		pfree(indextids);
 		return neighbors;
 	}
 
@@ -410,8 +410,6 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int auxM, int lm, 
 		HnswPtrStore(base, hc->element, e);
 	}
 
-	pfree(indextids);
-
 	return neighbors;
 }
 
@@ -425,11 +423,10 @@ HnswLoadAuxNeighbors(HnswElement element, Relation index, int m, int auxM, AttrN
 	int			natts = IndexRelationGetNumberOfAttributes(index);
 	int			am = HnswGetAuxMForAttno(auxM, natts, attno);
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(am, NULL);
-	ItemPointerData *indextids = palloc(am * sizeof(ItemPointerData));
+	ItemPointerData indextids[HNSW_MAX_AUX_M];
 
 	if (!HnswLoadAuxNeighborTids(element, indextids, index, m, auxM, attno))
 	{
-		pfree(indextids);
 		return neighbors;
 	}
 
@@ -446,8 +443,6 @@ HnswLoadAuxNeighbors(HnswElement element, Relation index, int m, int auxM, AttrN
 		hc = &neighbors->items[neighbors->length++];
 		HnswPtrStore(base, hc->element, e);
 	}
-
-	pfree(indextids);
 
 	return neighbors;
 }
@@ -570,9 +565,11 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 {
 	for (int i = 0; i < lm; i++)
 	{
+		ItemPointer indextid;
+
 		if (startIdx + i >= ntup->count)
 			break;
-		ItemPointer indextid = &ntup->indextids[startIdx + i];
+		indextid = &ntup->indextids[startIdx + i];
 
 		if (!ItemPointerIsValid(indextid))
 			break;
@@ -649,6 +646,10 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 	{
 		HnswPendingUpdate *u = &updates[i];
 		HnswElement element = u->neighborElement;
+		HnswNeighborTuple ntup;
+		int idx = u->idx;
+		int lm = u->lm;
+		int startIdx = u->startIdx;
 
 		if (element->neighborPage != current_blkno)
 		{
@@ -676,10 +677,7 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 				page = BufferGetPage(buf);
 		}
 
-		HnswNeighborTuple ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
-		int idx = u->idx;
-		int lm = u->lm;
-		int startIdx = u->startIdx;
+		ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
 
 		if (checkExisting && ConnectionExists(e, ntup, startIdx, lm))
 			idx = -1;
@@ -723,7 +721,7 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 					{
 						if (!building)
 							GenericXLogAbort(state);
-						elog(WARNING, "Failed to expand dynamically sized HNSW tuple");
+						elog(ERROR, "Failed to expand dynamically sized HNSW tuple");
 					}
 					pfree(new_ntup);
 				}
